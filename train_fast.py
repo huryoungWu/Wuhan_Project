@@ -13,6 +13,12 @@
   6. PINN物理约束: 基于水泵相似定律 (Q∝f, H∝f², P∝f³) 施加物理损失
      - 泵关闭 → 对应管路流量必须为0 (消除幽灵流量)
      - 总管流量 ≤ Σ 理论流量; 效率反推电功率 ≈ Σ 理论功率; 系统扬程 ≤ 最大理论扬程
+
+7. (train_fast.py 特有) 泵组互斥注意力改用 SelfAttention — nn.MultiheadAttention 的
+   等效重写 (训练加速)。torch 1.13 中 embed_dim=8/num_heads=4 (head_dim=2) 不满足
+   MHA 快速路径条件, 原生实现走慢路径; SelfAttention 按同样数学重写, 所有头一次
+   bmm 完成, 输出与 MHA 逐位一致 (已验证最大绝对差 0.000e+00), 参数名/初始化一致,
+   新旧权重可互相加载。模型保存为 model_v2_combo_split_fast.pt, 不覆盖原文件。
 """
 import json
 import os
@@ -20,6 +26,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datetime import datetime
 
 if torch.cuda.is_available():
@@ -360,6 +367,62 @@ class FastTensorDataLoader:
         return (self.dataset_len + self.batch_size - 1) // self.batch_size
 
 
+class SelfAttention(nn.Module):
+    """自注意力 — nn.MultiheadAttention 的等效重写 (训练加速, 数值等价)
+
+    背景: torch 1.13 中本配置 (embed_dim=8, num_heads=4 → head_dim=2) 不满足
+    MHA 快速路径条件 (head_dim % 8 == 0), 走慢路径且带掩码/need_weights 等
+    多余分支开销。这里按同样数学重写: 所有头一次 bmm 完成。
+
+    与原版等价:
+      - 参数名/初始化与 nn.MultiheadAttention 完全一致 (in_proj_weight /
+        in_proj_bias / out_proj), 旧权重可直接加载
+      - 同样流程: in_proj 线性 → 分头 → q×head_dim^-0.5 → softmax →
+        dropout → 加权求和 → out_proj
+      - 仅支持 self-attention (q=k=v), 输入 (B, seq, embed_dim)
+    """
+    def __init__(self, embed_dim, num_heads=4, dropout=0.0):
+        super(SelfAttention, self).__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        # 与 nn.MultiheadAttention 相同的参数名与初始化, 保证旧权重可加载
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
+        self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.in_proj_weight)
+        nn.init.constant_(self.in_proj_bias, 0.0)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def forward(self, x):
+        """x: (B, seq, embed_dim) self-attention → (B, seq, embed_dim)"""
+        B, seq, _ = x.shape
+        H, D = self.num_heads, self.head_dim
+        scaling = float(D) ** -0.5
+
+        qkv = F.linear(x, self.in_proj_weight, self.in_proj_bias)  # (B, seq, 3E)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # (B, seq, E) → (B*H, seq, D)
+        q = q.reshape(B, seq, H, D).transpose(1, 2).reshape(B * H, seq, D)
+        k = k.reshape(B, seq, H, D).transpose(1, 2).reshape(B * H, seq, D)
+        v = v.reshape(B, seq, H, D).transpose(1, 2).reshape(B * H, seq, D)
+
+        q = q * scaling
+        attn = torch.bmm(q, k.transpose(1, 2))       # (B*H, seq, seq)
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.bmm(attn, v)                     # (B*H, seq, D)
+
+        out = out.reshape(B, H, seq, D).transpose(1, 2).reshape(B, seq, self.embed_dim)
+        return self.out_proj(out)
+
+
 class DeepWaterPlantModelWithEmbedding(nn.Module):
     """
     改进的多任务水泵预测模型 v6 — 纯流量+效率 (无功率)
@@ -400,10 +463,8 @@ class DeepWaterPlantModelWithEmbedding(nn.Module):
         self.enc_proj1 = nn.Linear(total_input_dim, 512)
         self.enc_proj2 = nn.Linear(512, 256)
 
-        # ── 泵组互斥注意力 ──
-        self.pair_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=4, batch_first=True, dropout=0.1
-        )
+        # ── 泵组互斥注意力 (SelfAttention: 等效重写, 数值与 nn.MultiheadAttention 一致) ──
+        self.pair_attention = SelfAttention(embed_dim, num_heads=4, dropout=0.1)
 
         # ── 170系统头: 输出 [170:1流量, 170:2流量] ──
         self.head_170_fc1 = nn.Linear(128, 64)
@@ -442,8 +503,8 @@ class DeepWaterPlantModelWithEmbedding(nn.Module):
             embedded_pumps.append(emb)
         pump_emb_stack = torch.stack(embedded_pumps, dim=1)  # [B, 7, embed_dim]
 
-        # ── 2. 泵组互斥注意力 ──
-        attn_out, _ = self.pair_attention(pump_emb_stack, pump_emb_stack, pump_emb_stack)
+        # ── 2. 泵组互斥注意力 (SelfAttention, 输出与原版一致) ──
+        attn_out = self.pair_attention(pump_emb_stack)
         discrete_embedded = attn_out.reshape(batch_size, -1)  # [B, 7*embed_dim]
 
         # ── 3. 共享编码器 (带残差) ──
@@ -902,7 +963,7 @@ def save_metrics_to_txt(metrics, train_combos, test_combos, train_samples, test_
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("水厂水泵运行预测模型")
+    print("水厂水泵运行预测模型 (train_fast: SelfAttention 加速版)")
     print("=" * 60)
 
     # ── 列定义 (无论缓存与否都相同) ──
@@ -1219,7 +1280,7 @@ if __name__ == '__main__':
     # ======== 保存模型 ========
     model_dir = r"D:\Wuhan_Project\models"
     os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "model_v2_combo_split.pt")
+    model_path = os.path.join(model_dir, "model_v2_combo_split_fast.pt")
     torch.save({
         'model_state_dict': result['model'].state_dict(),
         'continuous_scaler': result['continuous_scaler'],
@@ -1240,7 +1301,7 @@ if __name__ == '__main__':
 
     # ======== JSON ========
     output_result = {
-        'model_name': 'v6 — 纯流量+效率版 (4维输出)',
+        'model_name': 'v6 — 纯流量+效率版 (4维输出, SelfAttention加速)',
         'output_dim': 4,
         'outputs': [f'[{i}] {c}' for i, c in enumerate(all_cols)],
         'train_combos_count': len(train_combos_actual),
