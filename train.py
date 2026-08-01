@@ -7,6 +7,8 @@
   2. 按泵组组合划分训练/测试集
   3. 移除功率预测, 仅输出 3管流量 + 1效率 = 4维
   4. NN容量全部用于流量和效率
+  5. 压力修正: 修正后压力 = 原压力 - (吸水井液位-3.58)/102 (MPa)
+     液位读取自原始列 '170:吸水井液位', 修正后压力参与训练, 液位本身不进入特征
 """
 import json
 import os
@@ -198,6 +200,36 @@ def compute_efficiency(df, power_cols, flow_cols, pressure_col='170:总管压力
         print(f"\n保存含效率的CSV到: {csv_path}")
         df.to_csv(csv_path, index=False, encoding='utf-8-sig')
 
+    return df
+
+
+# ============================================================================
+# 0b. 压力修正
+# ============================================================================
+
+def correct_pressure(df, level_baseline=3.58, level_divisor=102.0):
+    """压力修正: 修正后压力 = 原压力 - (吸水井液位 - 3.58) / 102 (MPa)
+
+    吸水井液位读取自原始列 '170:吸水井液位' (m)。修正后的压力直接覆盖
+    df['170:总管压力'] 供下游清洗/效率计算/训练使用 (液位本身不进入特征)，
+    并保留一列 '170:总管压力_修正' 作为缓存标记。
+    """
+    level_col = '170:吸水井液位'
+    if level_col not in df.columns:
+        print(f"  [WARN] 缺少列 '{level_col}', 无法修正压力 (修正量=0)")
+        df['170:总管压力_修正'] = df['170:总管压力']
+        return df
+
+    level = df[level_col]
+    n_missing = int(level.isna().sum())
+    if n_missing > 0:
+        print(f"  [WARN] '{level_col}' 缺失 {n_missing} 行, 这些行按修正量=0处理")
+
+    correction = (level.fillna(level_baseline) - level_baseline) / level_divisor
+    df['170:总管压力_修正'] = df['170:总管压力'] - correction
+    df['170:总管压力'] = df['170:总管压力_修正']
+    print(f"  压力修正: 修正后压力 = 原压力 - (吸水井液位-{level_baseline})/{level_divisor}")
+    print(f"    修正后总管压力范围: [{df['170:总管压力'].min():.4f}, {df['170:总管压力'].max():.4f}] MPa")
     return df
 
 
@@ -769,7 +801,7 @@ def save_metrics_to_txt(metrics, train_combos, test_combos, train_samples, test_
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("水厂水泵运行预测模型 v6 — 纯流量+效率版")
+    print("水厂水泵运行预测模型")
     print("=" * 60)
 
     # ── 列定义 (无论缓存与否都相同) ──
@@ -801,11 +833,21 @@ if __name__ == '__main__':
     CACHE_PATH = r"D:\Wuhan_Project\new_data\processed_cache.parquet"
     TRAIN_SAMPLE_SIZE = None  # 训练集最多采样数，None=不采样
 
+    cache_usable = False
     if os.path.exists(CACHE_PATH):
         print(f"\n从缓存加载已处理数据: {CACHE_PATH}")
         t0 = time.time()
         df = pd.read_parquet(CACHE_PATH)
         print(f"数据形状: {df.shape}  加载耗时 {time.time()-t0:.1f}s")
+        if '170:总管压力_修正' in df.columns:
+            cache_usable = True
+        else:
+            print("  [WARN] 缓存为旧版(未含压力修正), 重新从CSV生成")
+
+    if cache_usable:
+        # 缓存已含修正压力: 修正值覆盖 170:总管压力
+        df['170:总管压力'] = df['170:总管压力_修正']
+        df = df.drop(columns=['170:总管压力_修正'])
         if 'F_DateTime' in df.columns:
             df['F_DateTime'] = pd.to_datetime(df['F_DateTime'])
     else:
@@ -815,6 +857,9 @@ if __name__ == '__main__':
         df = pd.read_csv(DATA_PATH)
         print(f"数据形状: {df.shape}  加载耗时 {time.time()-t0:.1f}s")
         print(f"时间范围: {df['F_DateTime'].min()} ~ {df['F_DateTime'].max()}")
+
+        # 压力修正: 修正后压力 = 原压力 - (吸水井液位-3.58)/102
+        df = correct_pressure(df)
 
         # ================================================================
         # 数据清洗
@@ -979,7 +1024,7 @@ if __name__ == '__main__':
 
     # 随机划分: 80% 训练, 20% 测试
     SEED = 42
-    USE_FIXED_SEED = False
+    USE_FIXED_SEED = True
     random.seed(SEED) if USE_FIXED_SEED else random.seed()
     shuffled_combos = random.sample(valid_combos, len(valid_combos))
     n_train_combos = max(1, int(len(valid_combos) * 0.8))
@@ -1085,6 +1130,7 @@ if __name__ == '__main__':
         'engineered_cols': engineered_cols,
         'all_output_cols': all_cols,
         'output_dim': 4,
+        'pressure_correction': {'level_baseline': 3.58, 'level_divisor': 102.0},
         'train_combos': sorted(train_combos_actual),
         'test_combos': sorted(test_combos_actual),
     }, model_path)

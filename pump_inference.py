@@ -4,7 +4,10 @@
 输入 (用户提供):
   - 7个泵运行状态 (0/1)
   - 7个泵运行频率 (Hz)，未运行泵填0
-  - 1个总管压力 (MPa)
+  - 1个总管压力 (MPa, 原始值)
+  - 1个吸水井液位 (m) — 用于压力修正
+
+压力修正: 修正后压力 = 原压力 - (吸水井液位 - 3.58) / 102，送入模型的是修正后的压力。
 
 输出:
   - 170:1瞬时流量 (m3/h)
@@ -17,7 +20,7 @@
 
 用法:
   model = PumpInference("models/model_v2_combo_split.pt")
-  flow_170_1, flow_170_2, flow_703, total_flow, eff = model.predict(states, freqs, pressure)
+  flow_170_1, flow_170_2, flow_703, total_flow, eff = model.predict(states, freqs, pressure, level)
 """
 
 import os
@@ -175,9 +178,11 @@ class PumpInference:
       - 总管流量 (m3/h) = 170:1 + 170:2 + 70:3
       - 总管效率 (%)
 
+    压力修正: 修正后压力 = 原压力 - (吸水井液位 - 3.58) / 102 (MPa)
+
     用法:
         model = PumpInference("models/model_v2_combo_split.pt")
-        flow_170_1, flow_170_2, flow_703, total_flow, eff = model.predict(states, freqs, pressure)
+        flow_170_1, flow_170_2, flow_703, total_flow, eff = model.predict(states, freqs, pressure, level)
     """
 
     def __init__(self, model_path=None):
@@ -213,6 +218,11 @@ class PumpInference:
         self.out_scaler = ckpt['output_scaler']
         self.all_output_cols = ckpt['all_output_cols']  # [170:1, 170:2, 70:3, 效率]
 
+        # 压力修正参数 (与 train.py 一致, 随权重保存; 旧权重无此字段时用默认值)
+        pc = ckpt.get('pressure_correction', {})
+        self.level_baseline = float(pc.get('level_baseline', 3.58))
+        self.level_divisor = float(pc.get('level_divisor', 102.0))
+
     def _preprocess(self, states, freqs, pressure):
         """原始输入 → 模型输入张量"""
         states = np.atleast_2d(np.asarray(states, dtype=np.int64))
@@ -236,14 +246,22 @@ class PumpInference:
         c_t = torch.tensor(cont_s, dtype=torch.float32, device=self.device)
         return d_t, c_t
 
-    def predict(self, states, freqs, pressure):
+    def _correct_pressure(self, pressure, level):
+        """修正后压力 = 原压力 - (吸水井液位 - 3.58) / 102 (MPa)，液位缺失按基准值处理(修正量=0)"""
+        pressure = np.atleast_1d(np.asarray(pressure, dtype=np.float32))
+        level = np.atleast_1d(np.asarray(level, dtype=np.float32))
+        level = np.nan_to_num(level, nan=self.level_baseline)
+        return pressure - (level - self.level_baseline) / self.level_divisor
+
+    def predict(self, states, freqs, pressure, level):
         """
         返回 (170:1流量, 170:2流量, 70:3流量, 总管流量, 总管效率)。
 
         参数:
             states:   (7,) 或 (n,7) — 7泵状态 (0/1)
             freqs:    (7,) 或 (n,7) — 7泵频率 (Hz)
-            pressure: float 或 (n,)  — 总管压力 (MPa)
+            pressure: float 或 (n,)  — 总管压力 (MPa, 原始值)
+            level:    float 或 (n,)  — 吸水井液位 (m), 用于压力修正
 
         返回:
             flow_170_1: 170:1管道瞬时流量 (m3/h)
@@ -252,7 +270,7 @@ class PumpInference:
             total_flow: 总管流量 (m3/h) = sum(三条管道)
             efficiency: 总管效率 (%)
         """
-        d_t, c_t = self._preprocess(states, freqs, pressure)
+        d_t, c_t = self._preprocess(states, freqs, self._correct_pressure(pressure, level))
 
         with torch.no_grad():
             out_s = self.model(d_t, c_t).cpu().numpy()
@@ -273,16 +291,16 @@ class PumpInference:
                     float(flow_703[0]), float(total_flow[0]), float(efficiency[0]))
         return flow_170_1, flow_170_2, flow_703, total_flow, efficiency
 
-    def predict_detail(self, states, freqs, pressure):
+    def predict_detail(self, states, freqs, pressure, level):
         """
-        返回全部4维明细 + 总管值。
+        返回全部4维明细 + 总管值。pressure/level 含义同 predict()。
 
         返回:
             detail:     dict {col_name: value}  4个明细
             total_flow: 总管流量 (m3/h)
             efficiency: 总管效率 (%)
         """
-        d_t, c_t = self._preprocess(states, freqs, pressure)
+        d_t, c_t = self._preprocess(states, freqs, self._correct_pressure(pressure, level))
 
         with torch.no_grad():
             out_s = self.model(d_t, c_t).cpu().numpy()
@@ -300,7 +318,8 @@ class PumpInference:
 
     def info(self):
         """打印模型信息"""
-        print(f"PumpInference — 加载 CQU_improve_v6 权重 (纯流量+效率)")
+        print(f"PumpInference")
+        print(f"  压力修正: 修正后压力 = 原压力 - (吸水井液位-{self.level_baseline})/{self.level_divisor} MPa")
         print(f"  设备: {self.device}")
         print(f"  输出明细 ({len(self.all_output_cols)}维): {self.all_output_cols}")
         print(f"  汇总输出: 170:1流量, 170:2流量, 70:3流量, 总管流量 (m3/h), 总管效率 (%)")
@@ -325,15 +344,16 @@ if __name__ == '__main__':
     states   = [1, 1, 0, 1, 1, 1, 1]
     freqs    = [48.7, 47.3, 0, 50.0, 41.5, 50.0, 50.0]
     pressure = 0.33
+    level    = 3.42  # 吸水井液位 (m)
 
-    flow_170_1, flow_170_2, flow_703, flow, eff = model.predict(states, freqs, pressure)
-    print(f"\n示例输入: 泵状态={states}, 频率={freqs}, 压力={pressure}")
+    flow_170_1, flow_170_2, flow_703, flow, eff = model.predict(states, freqs, pressure, level)
+    print(f"\n示例输入: 泵状态={states}, 频率={freqs}, 压力={pressure}, 液位={level}")
     print(f"推理结果: 170:1流量={flow_170_1:.0f} m3/h, 170:2流量={flow_170_2:.0f} m3/h, "
           f"70:3流量={flow_703:.0f} m3/h")
     print(f"          总管流量={flow:.0f} m3/h, 总管效率={eff:.1f}%")
 
     # 明细
-    detail, f, e = model.predict_detail(states, freqs, pressure)
+    detail, f, e = model.predict_detail(states, freqs, pressure, level)
     print(f"\n明细输出:")
     for k, v in detail.items():
         print(f"  {k}: {v:.2f}")
