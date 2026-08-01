@@ -1,0 +1,29 @@
+# 数据文件（体积大、可重新生成，不纳入版本控制）
+new_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+*.log
+
+# PyTorch / 模型相关
+*.pt
+*.pth
+!models/model_v2_combo_split.pt
+
+# 临时文件
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
