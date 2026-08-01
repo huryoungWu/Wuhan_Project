@@ -15,6 +15,7 @@
   - 70:3瞬时流量 (m3/h)
   - 总管流量 (m3/h)    = sum(170:1 + 170:2 + 70:3)
   - 总管效率 (%)
+  - 置信度: 泵组组合在真实数据中出现过→高, 未出现过→低 (predict_with_confidence)
 
 工程特征自动生成，权重文件由 CQU_improve_v6_flow_eff_only.py 训练产生。
 
@@ -27,6 +28,76 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+# ============================================================================
+# 真实数据中出现的泵组组合统计 (7位编码 P1~P7, 值 = 该组合出现次数)
+# 来源: new_data/merged_minute_all_with_efficiency.csv (3,036,418 条, 61 种组合)
+# 推理置信度: 组合出现在表中 → 高 (1.0); 未出现 → 低 (0.0)
+# ============================================================================
+APPEARED_COMBOS = {
+    "1000010": 287155,
+    "1100010": 267341,
+    "1100011": 221713,
+    "1101001": 188841,
+    "1101000": 188512,
+    "0001010": 183088,
+    "1001000": 177419,
+    "1000011": 160983,
+    "0101011": 143190,
+    "1001011": 104030,
+    "0011000": 98122,
+    "0110010": 82146,
+    "0111001": 81293,
+    "0110011": 75136,
+    "0010010": 72227,
+    "0101010": 70128,
+    "0111000": 60629,
+    "1001010": 55145,
+    "1000110": 51601,
+    "0011001": 43600,
+    "0001110": 43074,
+    "1001001": 42856,
+    "1001100": 42078,
+    "0001011": 38890,
+    "1001101": 33990,
+    "1000111": 32229,
+    "0010011": 27394,
+    "0001111": 26833,
+    "0101110": 25013,
+    "0011100": 20018,
+    "0011011": 17354,
+    "0011010": 16794,
+    "1011001": 8236,
+    "0011101": 8179,
+    "0000110": 7381,
+    "1010011": 5887,
+    "1011000": 4513,
+    "1001110": 4274,
+    "1100110": 3717,
+    "1100111": 2670,
+    "1101010": 1971,
+    "1010010": 1849,
+    "1101100": 1658,
+    "1101011": 1582,
+    "0111011": 883,
+    "1001111": 792,
+    "0010110": 752,
+    "0111010": 735,
+    "0111101": 452,
+    "1111000": 437,
+    "1101101": 355,
+    "0011110": 258,
+    "0110110": 165,
+    "1111001": 159,
+    "0101111": 139,
+    "1110011": 120,
+    "1101111": 117,
+    "0001100": 107,
+    "1110010": 106,
+    "1101110": 89,
+    "1100000": 13,
+}
 
 
 # ============================================================================
@@ -291,6 +362,34 @@ class PumpInference:
                     float(flow_703[0]), float(total_flow[0]), float(efficiency[0]))
         return flow_170_1, flow_170_2, flow_703, total_flow, efficiency
 
+    def combo_confidence(self, states):
+        """
+        泵组组合置信度: 组合在真实数据中出现过 → 高 (1.0), 未出现过 → 低 (0.0)。
+
+        返回 (confidence, count):
+          confidence: 1.0 (出现过) / 0.0 (未出现)
+          count:      该组合在真实数据中的出现次数 (未出现为 0)
+        """
+        states = np.atleast_2d(np.asarray(states, dtype=np.int64))
+        results = []
+        for row in states:
+            combo = ''.join(str(int(s)) for s in row)
+            cnt = APPEARED_COMBOS.get(combo, 0)
+            results.append((1.0 if cnt > 0 else 0.0, cnt))
+        return results[0] if len(results) == 1 else results
+
+    def predict_with_confidence(self, states, freqs, pressure, level):
+        """
+        同 predict(), 额外返回组合置信度 (出现过=高 1.0 / 未出现=低 0.0)。
+
+        返回:
+            flow_170_1, flow_170_2, flow_703, total_flow, efficiency  (同 predict)
+            confidence: 单样本返回 (conf, count); 多样本返回两个列表
+        """
+        f1, f2, f3, total, eff = self.predict(states, freqs, pressure, level)
+        conf = self.combo_confidence(states)
+        return f1, f2, f3, total, eff, conf
+
     def predict_detail(self, states, freqs, pressure, level):
         """
         返回全部4维明细 + 总管值。pressure/level 含义同 predict()。
@@ -323,6 +422,7 @@ class PumpInference:
         print(f"  设备: {self.device}")
         print(f"  输出明细 ({len(self.all_output_cols)}维): {self.all_output_cols}")
         print(f"  汇总输出: 170:1流量, 170:2流量, 70:3流量, 总管流量 (m3/h), 总管效率 (%)")
+        print(f"  置信度: 组合在真实数据中出现过→高 / 未出现→低 (库内 {len(APPEARED_COMBOS)} 种真实组合)")
 
 
 # ============================================================================
@@ -393,8 +493,9 @@ if __name__ == '__main__':
             print("\n──── 第一组: 实际数据中出现过的组合 (按占比降序) ────")
         elif i == len(cases_appeared):
             print("\n──── 第二组: 实际数据中从未出现的组合 ────")
-        f1, f2, f3, total, eff = model.predict(states, freqs, pressure, level)
+        f1, f2, f3, total, eff, conf = model.predict_with_confidence(states, freqs, pressure, level)
         combo = ''.join('1' if s else '0' for s in states)
+        conf_txt = f"置信度: 高 (出现 {conf[1]:,} 次)" if conf[0] > 0 else "置信度: 低 (未出现过)"
 
         # 理论流量: 管1+管2 ← Σ 泵1~6 Q额定×f/50; 管3 ← 泵7 Q额定×f/50
         t12 = sum(RATED_Q[i] * freqs[i] / 50.0 for i in range(6))
@@ -405,7 +506,7 @@ if __name__ == '__main__':
             return f"{100 * diff / t:+.0f}%" if t > 0 else "  -"
 
         print(f"\n[{name}]  开启组合={combo}  压力={pressure}  液位={level}")
-        print(f"  频率: {freqs}")
+        print(f"  频率: {freqs}  |  {conf_txt}")
         print(f"  预测: 管1+管2={p12:7.0f}  管3={f3:6.0f} m3/h | "
               f"总管={total:7.0f} m3/h | 效率={eff:5.1f}%")
         print(f"  理论: 管1+管2={t12:7.0f}  管3={t3:6.0f} m3/h")

@@ -4,6 +4,7 @@
 改进:
   1. 清洗 NaN 行、全停状态
   1b. 总功率由累计电度差分计算 (compute_total_power_from_meters)，p1~6用172电度Δ/Δh，p7用70:7总有功
+     泵级0值填充: 差分功率=0 且泵运行=1 (电表未刷新) → 最近有效读数填充; 泵停的0不填充
   2. 按泵组组合划分训练/测试集
   3. 移除功率预测, 仅输出 3管流量 + 1效率 = 4维
   4. NN容量全部用于流量和效率
@@ -141,15 +142,20 @@ def compute_total_power_from_meters(df):
     """从累计电度表读数差分计算7泵总功率 (kW)，写入 df['总功率'] 列。
 
     泵1~6: 172:1~6_泵电度 (累计kWh) → ΔkWh / Δ小时 → kW
-    泵7:   70:7_总有功 (W) → /1000 → kW
+          差分功率=0 但泵运行=1 (电表未及时刷新) → 用最近的有效读数填充;
+          泵运行=0 时功率=0 为真实停机, 不填充
+    泵7:   70:7_总有功 (W) → /1000 → kW (瞬时值, 0=泵停, 不填充)
     总功率 = 泵1+...+泵6 + 泵7
 
     分钟级差分噪声的处理：
-      - 零值 → ffill(limit=15)（电表非每分钟刷新）
+      - 泵级: 0功率+泵运行 → 最近有效值填充 (ffill(15)+bfill(15))
+      - 总功率层: 零值 → ffill(limit=15)（电表非每分钟刷新）
       - 5分钟滚动均值平滑尖峰
     """
     meter_cols = ['172:1_泵电度', '172:2_泵电度', '172:3_泵电度',
                   '172:4_泵电度', '172:5_泵电度', '172:6_泵电度']
+    state_cols = ['170:1_泵运行', '170:2_泵运行', '170:3_泵运行',
+                  '170:4_泵运行', '170:5_泵运行', '170:6_泵运行']
 
     # 时间差 (小时)
     if 'F_DateTime' in df.columns:
@@ -160,10 +166,15 @@ def compute_total_power_from_meters(df):
 
     # 泵1~6: 累计kWh差分 → kW
     pump_powers = {}
-    for col in meter_cols:
+    for col, state_col in zip(meter_cols, state_cols):
         name = col.replace('172:', '').replace('_泵电度', '')
         dkwh = df[col].diff()
-        pump_powers[f'泵{name}_功率_kW'] = (dkwh / dt_hours).clip(lower=0, upper=500)
+        p = (dkwh / dt_hours).clip(lower=0, upper=500)
+        # 功率=0 但泵在运行 → 泵开着而电表未及时刷新 → 用最近的有效读数填充
+        #   (泵停止时的 0 是真实停机, 不填充)
+        fill_mask = (p == 0) & (df[state_col] > 0)
+        p = p.mask(fill_mask).ffill(limit=15).bfill(limit=15).fillna(0)
+        pump_powers[f'泵{name}_功率_kW'] = p
 
     # 泵7: 瞬时有功 W → kW
     if '70:7_总有功' in df.columns:

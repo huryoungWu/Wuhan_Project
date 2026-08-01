@@ -12,25 +12,20 @@
   - 约束: 模型预测流量与目标流量偏差 ≤ ±100 m³/h
   - 目标: 满足约束的前提下, 预测总管效率最大化
 
-用法 (命令行):
-  python pump_optimizer.py --flow1 1500 --flow2 1200 --flow3 800 \
-      --pressure 0.42 --level 3.42
-
-用法 (代码):
+用法 (接口调用):
   from pump_inference import PumpInference
-  from pump_optimizer import optimize_strategy
+  from pump_optimizer import optimize_strategy, print_result
 
   model = PumpInference("models/model_v2_combo_split.pt")
   result = optimize_strategy(model, target_flows=[1500, 1200, 800],
                              pressure=0.42, level=3.42)
   print(result['states'], result['freqs'])
+  print_result(result)
 
 注意:
   - 模型是数据驱动的代理模型, 寻优结果作为运行建议, 上线前需结合实际工况校核
   - 种群大小不要设为 7 (推理脚本会把 n==7 误判为单样本而平铺频率)
 """
-
-import argparse
 
 import numpy as np
 
@@ -224,32 +219,108 @@ def print_result(result):
 
 
 # ============================================================================
-# 命令行入口
+# 真实工况测试样本 + 基准测试
 # ============================================================================
 
-def main():
-    ap = argparse.ArgumentParser(description='水泵开启策略寻优 (遗传算法, 效率最优)')
-    ap.add_argument('--flow1', type=float, required=True, help='170:1目标流量 (m3/h)')
-    ap.add_argument('--flow2', type=float, required=True, help='170:2目标流量 (m3/h)')
-    ap.add_argument('--flow3', type=float, required=True, help='70:3目标流量 (m3/h)')
-    ap.add_argument('--pressure', type=float, required=True, help='总管压力 (MPa)')
-    ap.add_argument('--level', type=float, default=3.58, help='吸水井液位 (m), 默认3.58 (修正量=0)')
-    ap.add_argument('--model', default=None, help='权重文件路径 (默认 models/model_v2_combo_split.pt)')
-    ap.add_argument('--pop', type=int, default=POP_SIZE, help='种群大小 (勿设为7)')
-    ap.add_argument('--gens', type=int, default=N_GENERATIONS, help='迭代代数')
-    ap.add_argument('--seed', type=int, default=SEED, help='随机种子')
-    ap.add_argument('--topk', type=int, default=3, help='输出前几个不同开启策略')
-    args = ap.parse_args()
+# 第一组: 实际数据中出现过的组合 (按占比降序, 来自 pump_inference 推理输出)
+#   元组: (名称, 7泵状态, 7泵频率, 总管压力 MPa, 吸水井液位 m)
+#   预测流量由模型现算: 每例以模型对该真实工况的预测流量 [170:1, 170:2, 70:3]
+#   作为寻优目标, 压力/液位取真实值, 检验寻优器能否找到 ≥ 实际效率的策略。
+REAL_CASES = [
+    ("1000010 P1+P6        (11.6%)", [1, 0, 0, 0, 0, 1, 0], [44.7, 0, 0, 0, 0, 50.0, 0],       0.3106, 3.32),
+    ("1100010 P1+P2+P6     (10.6%)", [1, 1, 0, 0, 0, 1, 0], [48.8, 46.2, 0, 0, 0, 50.0, 0],    0.3318, 3.28),
+    ("1100011 P1+P2+P6+P7   (8.7%)", [1, 1, 0, 0, 0, 1, 1], [48.3, 45.5, 0, 0, 0, 50.0, 49.9], 0.3327, 3.23),
+    ("1101000 P1+P2+P4      (7.5%)", [1, 1, 0, 1, 0, 0, 0], [48.8, 46.5, 0, 50.0, 0, 0, 0],    0.3318, 3.25),
+    ("0001010 P4+P6         (7.4%)", [0, 0, 0, 1, 0, 1, 0], [0, 0, 0, 45.1, 0, 50.0, 0],       0.3078, 3.42),
+    ("1001000 P1+P4         (7.2%)", [1, 0, 0, 1, 0, 0, 0], [45.2, 0, 0, 50.0, 0, 0, 0],       0.3120, 3.32),
+    ("1101001 P1+P2+P4+P7   (6.6%)", [1, 1, 0, 1, 0, 0, 1], [49.1, 47.5, 0, 50.0, 0, 0, 49.9], 0.3328, 3.11),
+    ("1000011 P1+P6+P7      (5.7%)", [1, 0, 0, 0, 0, 1, 1], [48.3, 0, 0, 0, 0, 50.0, 50.0],    0.3298, 3.36),
+    ("0101011 P2+P4+P6+P7   (5.5%)", [0, 1, 0, 1, 0, 1, 1], [0, 45.6, 0, 49.4, 0, 50.0, 49.9], 0.3306, 3.38),
+    ("0110010 P2+P3+P6      (3.3%)", [0, 1, 1, 0, 0, 1, 0], [0, 45.9, 49.3, 0, 0, 50.0, 0],    0.3325, 3.20),
+    ("1001011 P1+P4+P6+P7   (2.9%)", [1, 0, 0, 1, 0, 1, 1], [46.8, 0, 0, 50.0, 0, 50.0, 49.9], 0.3352, 3.00),
+    ("0010010 P3+P6         (2.8%)", [0, 0, 1, 0, 0, 1, 0], [0, 0, 45.2, 0, 0, 50.0, 0],       0.3120, 3.27),
+    ("0101010 P2+P4+P6      (2.6%)", [0, 1, 0, 1, 0, 1, 0], [0, 46.7, 0, 49.6, 0, 50.0, 0],    0.3307, 3.19),
+    ("0110011 P2+P3+P6+P7   (2.4%)", [0, 1, 1, 0, 0, 1, 1], [0, 46.4, 49.4, 0, 0, 50.0, 49.8], 0.3344, 2.93),
+    ("1000110 P1+P5+P6      (2.1%)", [1, 0, 0, 0, 1, 1, 0], [48.4, 0, 0, 0, 45.6, 50.0, 0],    0.3305, 3.36),
+]
 
-    model = PumpInference(args.model)
-    result = optimize_strategy(
-        model, [args.flow1, args.flow2, args.flow3],
-        args.pressure, args.level,
-        pop_size=args.pop, n_generations=args.gens,
-        seed=args.seed, top_k=args.topk,
-    )
-    print_result(result)
 
+def run_benchmark(model, cases=None, **opt_kwargs):
+    """真实工况基准测试: 以模型对真实工况的预测流量为寻优目标, 逐例寻优。
+
+    每例流程:
+      1. model.predict(真实状态/频率/压力/液位) → 预测流量 [170:1, 170:2, 70:3] 与效率
+      2. 以该预测流量为目标调用 optimize_strategy (压力/液位取真实值)
+      3. 寻优方案的预测效率 vs 实际策略的预测效率 (同为模型输出, 口径一致)
+
+    参数:
+        model:       PumpInference 实例
+        cases:       测试样本列表 (默认 REAL_CASES)
+        opt_kwargs:  传给 optimize_strategy 的寻优参数 (pop_size/seed/top_k 等)
+
+    返回:
+        list[dict]: 每例 {name, states, freqs, pressure, level,
+                          real_flows, real_total, real_eff, opt}
+    """
+    if cases is None:
+        cases = REAL_CASES
+    rows = []
+    for name, states, freqs, pressure, level in cases:
+        f1, f2, f3, total, eff = model.predict(states, freqs, pressure, level)
+        opt = optimize_strategy(model, [f1, f2, f3], pressure, level, **opt_kwargs)
+        rows.append({
+            'name': name,
+            'states': np.asarray(states),
+            'freqs': np.asarray(freqs),
+            'pressure': pressure,
+            'level': level,
+            'real_flows': np.asarray([f1, f2, f3]),
+            'real_total': total,
+            'real_eff': eff,
+            'opt': opt,
+        })
+    return rows
+
+
+def print_benchmark(rows):
+    """打印基准测试结果: 每例对比 实际策略 vs 寻优方案"""
+    print("\n" + "=" * 78)
+    print("基准测试: 实际工况预测流量 → 寻优器反推策略")
+    print("=" * 78)
+    n_feasible = 0
+    n_better = 0
+    for r in rows:
+        best = r['opt']['candidates'][0]
+        feasible = best['feasible']
+        n_feasible += int(feasible)
+        delta = best['efficiency'] - r['real_eff']
+        n_better += int(delta > 0)
+        combo = ''.join('1' if s else '0' for s in best['states'])
+
+        print(f"\n[{r['name']}]")
+        print(f"  实际策略: 频率={r['freqs'].tolist()}")
+        print(f"    预测: 管1+管2={r['real_flows'][0] + r['real_flows'][1]:7.1f}  "
+              f"管3={r['real_flows'][2]:6.1f} | 总管={r['real_total']:7.1f} | "
+              f"效率={r['real_eff']:5.1f}%")
+        print(f"  寻优目标: 170:1={r['opt']['target_flows'][0]:.1f}  "
+              f"170:2={r['opt']['target_flows'][1]:.1f}  70:3={r['opt']['target_flows'][2]:.1f} m3/h")
+        print(f"  寻优方案: 组合={combo}  频率={best['freqs'].tolist()}  压力={best['pressure']:.4f}")
+        print(f"    预测: 管1+管2={best['pred_flows'][0] + best['pred_flows'][1]:7.1f}  "
+              f"管3={best['pred_flows'][2]:6.1f} | 总管={best['total_flow']:7.1f} | "
+              f"效率={best['efficiency']:5.1f}%  [{'可行' if feasible else '超差'}]")
+        print(f"  效率对比: {r['real_eff']:.1f}% → {best['efficiency']:.1f}% ({delta:+.1f} pp)")
+
+    n = len(rows)
+    print("\n" + "-" * 78)
+    print(f"汇总: {n} 个工况, 可行 {n_feasible}/{n}, 效率提升 {n_better}/{n}")
+    print("-" * 78)
+
+
+# ============================================================================
+# 接口调用示例 (直接运行本文件时演示)
+# ============================================================================
 
 if __name__ == '__main__':
-    main()
+    model = PumpInference("models/model_v2_combo_split.pt")
+    rows = run_benchmark(model)
+    print_benchmark(rows)
