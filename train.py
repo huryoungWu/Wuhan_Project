@@ -9,6 +9,9 @@
   4. NN容量全部用于流量和效率
   5. 压力修正: 修正后压力 = 原压力 - (吸水井液位-3.58)/102 (MPa)
      液位读取自原始列 '170:吸水井液位', 修正后压力参与训练, 液位本身不进入特征
+  6. PINN物理约束: 基于水泵相似定律 (Q∝f, H∝f², P∝f³) 施加物理损失
+     - 泵关闭 → 对应管路流量必须为0 (消除幽灵流量)
+     - 总管流量 ≤ Σ 理论流量; 效率反推电功率 ≈ Σ 理论功率; 系统扬程 ≤ 最大理论扬程
 """
 import json
 import os
@@ -231,6 +234,75 @@ def correct_pressure(df, level_baseline=3.58, level_divisor=102.0):
     print(f"  压力修正: 修正后压力 = 原压力 - (吸水井液位-{level_baseline})/{level_divisor}")
     print(f"    修正后总管压力范围: [{df['170:总管压力'].min():.4f}, {df['170:总管压力'].max():.4f}] MPa")
     return df
+
+
+# ============================================================================
+# 0c. 泵额定参数与 PINN 物理约束 (相似定律)
+# ============================================================================
+
+# 7台泵额定参数 (顺序: P1~P7), 相似定律: Q∝f, H∝f², P∝f³
+RATED_Q = [2020, 670, 2020, 1260, 670, 1260, 670]   # 额定流量 (m3/h)
+RATED_P = [220, 132, 220, 220, 132, 220, 90]        # 额定功率 (kW)
+RATED_H = [32, 43, 32, 43, 43, 43, 33]              # 额定扬程 (m)
+RATED_F = 50.0                                       # 额定频率 (Hz)
+
+# 物理约束权重
+W_GHOST = 0.01    # 幽灵流量 (泵关→对应管路流量必须为0)
+W_FLOW  = 0.01    # 总管流量上界 ≤ Σ理论流量
+W_POWER = 1e-4    # 效率反推电功率 ≈ Σ理论功率
+W_HEAD  = 0.05    # 系统扬程 ≤ 运行泵最大理论扬程×1.2
+SLACK   = 1.15    # 物理上界允许超出15% (泵曲线裕度/传感器误差)
+
+
+def physics_loss_pump(discrete_x, continuous_x, y_pred_scaled,
+                      cont_mean, cont_scale, out_mean, out_scale,
+                      rated_q, rated_p, rated_h, rated_f=RATED_F,
+                      w_ghost=W_GHOST, w_flow=W_FLOW, w_power=W_POWER, w_head=W_HEAD,
+                      slack=SLACK):
+    """PINN 物理约束损失 — 基于水泵相似定律, 在物理空间计算 (可微, 梯度可回传)
+
+    y_pred_scaled 经输出标准化器反变换回物理空间后施加约束:
+      1. 幽灵流量: 泵1~6全停 → 170:1/170:2 流量必须为0; 泵7停 → 70:3 为0 (硬约束)
+      2. 流量上界: 总管流量 ≤ slack × Σ 运行泵额定流量×(f/f₀)   (Q∝f)
+      3. 功率一致: 效率反推电功率 ≈ Σ 运行泵额定功率×(f/f₀)³  (P∝f³, 上界×slack)
+      4. 扬程约束: 系统扬程 ≤ slack × 1.2 × 运行泵最大理论扬程    (H∝f²)
+      slack=1.15 表示物理上界允许超出约15% (泵曲线裕度/传感器误差)
+    """
+    y = y_pred_scaled.float() * out_scale + out_mean    # (B,4) 物理空间
+    f1, f2, f3, eff = y[:, 0], y[:, 1], y[:, 2], y[:, 3]
+
+    freqs = continuous_x[:, :7] * cont_scale[:7] + cont_mean[:7]   # Hz
+    press = continuous_x[:, 7] * cont_scale[7] + cont_mean[7]      # MPa
+    states = discrete_x.float()                                     # (B,7) 0/1
+
+    fr = freqs / rated_f
+    q_theory = states * rated_q * fr               # 理论流量 (m3/h)
+    p_theory = states * rated_p * fr ** 3          # 理论功率 (kW)
+    h_theory = states * rated_h * fr ** 2          # 理论扬程 (m)
+
+    relu = torch.relu
+
+    # 1) 幽灵流量: 泵关 → 对应管路流量必须为0
+    main_off = (states[:, :6].sum(dim=1) == 0).float()
+    p7_off = (states[:, 6] == 0).float()
+    L_ghost = (main_off * (relu(f1) + relu(f2))).mean() + (p7_off * relu(f3)).mean()
+
+    # 2) 流量上界: 总管流量 ≤ slack × Σ 理论流量 (允许超出15%)
+    total_q = f1 + f2 + f3
+    L_flow = relu(total_q - slack * q_theory.sum(dim=1)).mean()
+
+    # 3) 功率一致性: 水力功率/效率 → 电功率 ≈ Σ 理论功率 (上界×slack)
+    head_m = press * 102.0                          # MPa → 米水柱
+    ph_kw = 9.81 * total_q * head_m / 3600.0        # 水力功率 (kW)
+    pe = ph_kw / (eff / 100.0 + 1e-6)               # 效率反推电功率 (kW)
+    L_power = (relu(pe - 1.5 * slack * p_theory.sum(dim=1))
+               + relu(0.33 * p_theory.sum(dim=1) - pe)).mean()
+
+    # 4) 扬程约束: 系统扬程 ≤ slack × 1.2 × 最大理论扬程
+    h_max = h_theory.max(dim=1).values
+    L_head = relu(head_m - slack * 1.2 * h_max).mean()
+
+    return w_ghost * L_ghost + w_flow * L_flow + w_power * L_power + w_head * L_head
 
 
 # ============================================================================
@@ -483,6 +555,15 @@ def train_model(train_df, test_df, discrete_cols, continuous_cols,
     X_continuous_test_t = torch.tensor(X_continuous_test_scaled, dtype=torch.float32, device=device)
     y_test_t = torch.tensor(y_test_scaled, dtype=torch.float32, device=device)
 
+    # PINN 物理约束所需张量 (标准化器仿射参数 + 泵额定参数)
+    cont_mean_t = torch.tensor(continuous_scaler.mean_, dtype=torch.float32, device=device)
+    cont_scale_t = torch.tensor(continuous_scaler.scale_, dtype=torch.float32, device=device)
+    out_mean_t = torch.tensor(output_scaler.mean_, dtype=torch.float32, device=device)
+    out_scale_t = torch.tensor(output_scaler.scale_, dtype=torch.float32, device=device)
+    rated_q_t = torch.tensor(RATED_Q, dtype=torch.float32, device=device)
+    rated_p_t = torch.tensor(RATED_P, dtype=torch.float32, device=device)
+    rated_h_t = torch.tensor(RATED_H, dtype=torch.float32, device=device)
+
     train_loader = FastTensorDataLoader(
         X_discrete_train_t, X_continuous_train_t, y_train_t,
         batch_size=batch_size, shuffle=True
@@ -537,10 +618,16 @@ def train_model(train_df, test_df, discrete_cols, continuous_cols,
             if use_amp and scaler is not None:
                 with torch.amp.autocast('cuda', enabled=use_amp):
                     outputs = model(discrete_batch, continuous_batch)
-                    loss = criterion(outputs, y_batch)
+                    loss = criterion(outputs, y_batch) + physics_loss_pump(
+                        discrete_batch, continuous_batch, outputs,
+                        cont_mean_t, cont_scale_t, out_mean_t, out_scale_t,
+                        rated_q_t, rated_p_t, rated_h_t)
             else:
                 outputs = model(discrete_batch, continuous_batch)
-                loss = criterion(outputs, y_batch)
+                loss = criterion(outputs, y_batch) + physics_loss_pump(
+                    discrete_batch, continuous_batch, outputs,
+                    cont_mean_t, cont_scale_t, out_mean_t, out_scale_t,
+                    rated_q_t, rated_p_t, rated_h_t)
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
             if use_amp and scaler is not None:
@@ -564,7 +651,10 @@ def train_model(train_df, test_df, discrete_cols, continuous_cols,
                         outputs = model(discrete_batch, continuous_batch)
                 else:
                     outputs = model(discrete_batch, continuous_batch)
-                val_loss += criterion(outputs, y_batch).item()
+                val_loss += (criterion(outputs, y_batch) + physics_loss_pump(
+                    discrete_batch, continuous_batch, outputs,
+                    cont_mean_t, cont_scale_t, out_mean_t, out_scale_t,
+                    rated_q_t, rated_p_t, rated_h_t)).item()
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(test_loader)
@@ -1131,6 +1221,7 @@ if __name__ == '__main__':
         'all_output_cols': all_cols,
         'output_dim': 4,
         'pressure_correction': {'level_baseline': 3.58, 'level_divisor': 102.0},
+        'rated_specs': {'Q_m3h': RATED_Q, 'P_kW': RATED_P, 'H_m': RATED_H, 'f_Hz': RATED_F},
         'train_combos': sorted(train_combos_actual),
         'test_combos': sorted(test_combos_actual),
     }, model_path)
