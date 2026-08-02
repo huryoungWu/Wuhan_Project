@@ -138,43 +138,68 @@ def clean_pump_power(df, freq_cols, power_cols,
     return df, stats
 
 
+def _pump_power_from_meter(kwh_series, state_series, time_index, clip_upper=500.0):
+    """累计电度表 → 泵功率 (kW)，按秒级时间轴输出。
+
+    物理背景: 电度表按 0.25 kWh 分度、每 ~5s 才跳一次，而数据是 1s 粒度。
+      若在 1s 粒度上直接差分，跳表瞬间 ΔkWh/(1/3600h) = 900 kW 虚假脉冲
+      (被 clip 到 500 后 ffill 填满跳表间隙)，导致总功率虚高 ~2.7 倍。
+    正确做法: 先按分钟聚合 (每分钟取末值)，在分钟粒度上差分:
+      分钟功率 = 该分钟内电量 / 1min，不受跳表节奏影响。
+    分钟间无跳表 (Δ=0) 但泵在运行 → 沿用上一分钟功率 (ffill, 限30分钟);
+    泵停止 → 功率强制为 0 (真实停机, 不填充)。
+    """
+    kwh_min = kwh_series.resample('1min').last()
+    state_min = state_series.resample('1min').max()
+    dt_h = kwh_min.index.to_series().diff().dt.total_seconds() / 3600.0
+    p_min = (kwh_min.diff() / dt_h).clip(lower=0, upper=clip_upper)
+    running = state_min > 0
+    p_min = p_min.mask(p_min == 0)          # 分钟无跳表 → NaN (待沿用)
+    p_min = p_min.ffill(limit=30).bfill(limit=30)
+    p_min = p_min.where(running, 0.0).fillna(0.0)   # 泵停止 → 0
+    p_sec = p_min.reindex(time_index, method='ffill').fillna(0.0)
+    p_sec = p_sec.where(state_series.values > 0, 0.0)  # 秒级: 泵停止 → 0
+    return p_sec.values
+
+
 def compute_total_power_from_meters(df):
     """从累计电度表读数差分计算7泵总功率 (kW)，写入 df['总功率'] 列。
 
-    泵1~6: 172:1~6_泵电度 (累计kWh) → ΔkWh / Δ小时 → kW
-          差分功率=0 但泵运行=1 (电表未及时刷新) → 用最近的有效读数填充;
-          泵运行=0 时功率=0 为真实停机, 不填充
+    泵1~6: 172:1~6_泵电度 (累计kWh) → 分钟级 ΔkWh / Δ小时 → kW
+          (分钟级差分, 避免秒级跳表脉冲; 无跳表分钟沿用上分钟, 泵停=0)
     泵7:   70:7_总有功 (W) → /1000 → kW (瞬时值, 0=泵停, 不填充)
     总功率 = 泵1+...+泵6 + 泵7
 
     分钟级差分噪声的处理：
-      - 泵级: 0功率+泵运行 → 最近有效值填充 (ffill(15)+bfill(15))
+      - 泵级: 分钟无跳表+泵运行 → 沿用上分钟功率 (ffill(30) 即30分钟)
       - 总功率层: 零值 → ffill(limit=15)（电表非每分钟刷新）
-      - 5分钟滚动均值平滑尖峰
+      - 5秒滚动均值平滑尖峰
     """
     meter_cols = ['172:1_泵电度', '172:2_泵电度', '172:3_泵电度',
                   '172:4_泵电度', '172:5_泵电度', '172:6_泵电度']
     state_cols = ['170:1_泵运行', '170:2_泵运行', '170:3_泵运行',
                   '170:4_泵运行', '170:5_泵运行', '170:6_泵运行']
 
-    # 时间差 (小时)
+    # 时间轴 → DatetimeIndex; 差分依赖时间顺序, 未排序则先排序
     if 'F_DateTime' in df.columns:
-        time_series = pd.to_datetime(df['F_DateTime'])
+        time_index = pd.DatetimeIndex(pd.to_datetime(df['F_DateTime']))
     else:
-        time_series = pd.to_datetime(df.index)
-    dt_hours = time_series.diff().dt.total_seconds() / 3600.0
+        time_index = pd.DatetimeIndex(pd.to_datetime(df.index))
+    if not time_index.is_monotonic_increasing:
+        print("  [WARN] 数据未按时间排序, 先排序再差分")
+        order = time_index.argsort()
+        df = df.iloc[order].reset_index(drop=True)
+        time_index = pd.DatetimeIndex(pd.to_datetime(df['F_DateTime']))
 
-    # 泵1~6: 累计kWh差分 → kW
+    # 泵1~6: 分钟级累计kWh差分 → kW (修正秒级跳表脉冲)
     pump_powers = {}
     for col, state_col in zip(meter_cols, state_cols):
         name = col.replace('172:', '').replace('_泵电度', '')
-        dkwh = df[col].diff()
-        p = (dkwh / dt_hours).clip(lower=0, upper=500)
-        # 功率=0 但泵在运行 → 泵开着而电表未及时刷新 → 用最近的有效读数填充
-        #   (泵停止时的 0 是真实停机, 不填充)
-        fill_mask = (p == 0) & (df[state_col] > 0)
-        p = p.mask(fill_mask).ffill(limit=15).bfill(limit=15).fillna(0)
+        kwh_series = pd.Series(df[col].values, index=time_index)
+        state_series = pd.Series(df[state_col].values, index=time_index)
+        p = _pump_power_from_meter(kwh_series, state_series, time_index)
         pump_powers[f'泵{name}_功率_kW'] = p
+        df[f'泵{name}_功率_kW'] = p
 
     # 泵7: 瞬时有功 W → kW
     if '70:7_总有功' in df.columns:
@@ -195,7 +220,7 @@ def compute_total_power_from_meters(df):
 
 
 def compute_efficiency(df, power_cols, flow_cols, pressure_col='170:总管压力',
-                       pf_estimate=0.88, save_csv=True):
+                       pf_estimate=0.88, save_csv=True, csv_path=None):
     """计算系统总管效率并写入CSV。"""
     df['总流量_m3h'] = df[flow_cols[0]].fillna(0) + df[flow_cols[1]].fillna(0) + df[flow_cols[2]].fillna(0)
     df['水力功率_kW'] = 9.81 * df['总流量_m3h'] * df[pressure_col].fillna(0) * 102 / 3600
@@ -210,7 +235,8 @@ def compute_efficiency(df, power_cols, flow_cols, pressure_col='170:总管压力
     # df['视在效率_valid'] = np.where(valid_mask, df['视在效率_pct'], np.nan)
 
     if save_csv:
-        csv_path = r"D:\Wuhan_Project\new_data\merged_minute_all_with_efficiency.csv"
+        if csv_path is None:
+            csv_path = r"D:\Wuhan_Project\new_data\merged_minute_all_with_efficiency.csv"
         print(f"\n保存含效率的CSV到: {csv_path}")
         df.to_csv(csv_path, index=False, encoding='utf-8-sig')
 
@@ -805,7 +831,7 @@ def evaluate_by_combination(test_df, y_true, y_pred, output_cols):
 # ============================================================================
 
 def save_metrics_to_txt(metrics, train_combos, test_combos, train_samples, test_samples,
-                         all_output_cols, output_dir=None):
+                         all_output_cols, output_dir="results"):
     """将指标结果保存到本地txt文件，文件名含时间戳。
 
     Parameters
@@ -932,6 +958,7 @@ if __name__ == '__main__':
 
     # ── Parquet 缓存：跳过重复的 CSV 加载和清洗 ──
     CACHE_PATH = r"D:\Wuhan_Project\new_data\processed_cache.parquet"
+    CACHE_VERSION = 'power_diff_v2'  # 功率口径: 分钟级差分 (修正秒级跳表脉冲)
     TRAIN_SAMPLE_SIZE = None  # 训练集最多采样数，None=不采样
 
     cache_usable = False
@@ -940,15 +967,17 @@ if __name__ == '__main__':
         t0 = time.time()
         df = pd.read_parquet(CACHE_PATH)
         print(f"数据形状: {df.shape}  加载耗时 {time.time()-t0:.1f}s")
-        if '170:总管压力_修正' in df.columns:
+        if ('170:总管压力_修正' in df.columns
+                and '_cache_version' in df.columns
+                and (df['_cache_version'] == CACHE_VERSION).all()):
             cache_usable = True
         else:
-            print("  [WARN] 缓存为旧版(未含压力修正), 重新从CSV生成")
+            print(f"  [WARN] 缓存为旧版(未含压力修正或功率口径非{CACHE_VERSION}), 重新从CSV生成")
 
     if cache_usable:
         # 缓存已含修正压力: 修正值覆盖 170:总管压力
         df['170:总管压力'] = df['170:总管压力_修正']
-        df = df.drop(columns=['170:总管压力_修正'])
+        df = df.drop(columns=['170:总管压力_修正', '_cache_version'])
         if 'F_DateTime' in df.columns:
             df['F_DateTime'] = pd.to_datetime(df['F_DateTime'])
     else:
@@ -1077,7 +1106,8 @@ if __name__ == '__main__':
               f"(剔除 {clean_stats['total_removed']:,}, {clean_stats['total_removed']/clean_stats['total_before']*100:.2f}%) "
               f"耗时 {time.time()-t_clean:.1f}s")
 
-        # 保存缓存
+        # 保存缓存 (带功率口径版本标记)
+        df['_cache_version'] = CACHE_VERSION
         print(f"\n保存处理缓存: {CACHE_PATH}")
         df.to_parquet(CACHE_PATH, index=False)
 
