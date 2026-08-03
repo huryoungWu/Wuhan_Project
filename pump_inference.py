@@ -15,19 +15,28 @@
   - 70:3瞬时流量 (m3/h)
   - 总管流量 (m3/h)    = sum(170:1 + 170:2 + 70:3)
   - 总管效率 (%)
+  - 千吨水电耗 (kWh/千吨) = 272.5 × H_eff / 效率%, H_eff = 压力×102 − (液位−2.35)
   - 置信度: 泵组组合在真实数据中出现过→高, 未出现过→低 (predict_with_confidence)
 
 工程特征自动生成，权重文件由 CQU_improve_v6_flow_eff_only.py 训练产生。
 
 用法:
   model = PumpInference("models/model_v2_combo_split.pt")
-  flow_170_1, flow_170_2, flow_703, total_flow, eff = model.predict(states, freqs, pressure, level)
+  flow_170_1, flow_170_2, flow_703, total_flow, eff, kwt = model.predict(states, freqs, pressure, level)
 """
 
 import os
 import numpy as np
 import torch
 import torch.nn as nn
+
+# ============================================================================
+# 千吨水电耗换算常量 (口径同 optimizer.py)
+#   H_eff = 压力(MPa)×102 − (液位 − PUMP_LEVEL)  有效扬程 (m)
+#   kwt   = 272.5 × H_eff / 效率(%)   (kWh/千吨水)
+# ============================================================================
+PUMP_LEVEL = 2.35   # 泵安装基准液位 (m)
+KWT_COEF = 272.5    # 由 ρ·g/3.6e6 × 1000 × 100 折算 (ρ=1000 kg/m³, g=9.81)
 
 
 # ============================================================================
@@ -253,7 +262,7 @@ class PumpInference:
 
     用法:
         model = PumpInference("models/model_v2_combo_split.pt")
-        flow_170_1, flow_170_2, flow_703, total_flow, eff = model.predict(states, freqs, pressure, level)
+        flow_170_1, flow_170_2, flow_703, total_flow, eff, kwt = model.predict(states, freqs, pressure, level)
     """
 
     def __init__(self, model_path=None):
@@ -340,6 +349,7 @@ class PumpInference:
             flow_703:   70:3管道瞬时流量 (m3/h)
             total_flow: 总管流量 (m3/h) = sum(三条管道)
             efficiency: 总管效率 (%)
+            kwt:        千吨水电耗 (kWh/千吨) = 272.5 × H_eff / 效率%
         """
         d_t, c_t = self._preprocess(states, freqs, self._correct_pressure(pressure, level))
 
@@ -357,10 +367,19 @@ class PumpInference:
         total_flow = out[:, 0] + out[:, 1] + out[:, 2]   # 3管流量之和
         efficiency = out[:, 3]                            # 效率
 
+        # 千吨水电耗 (kWh/千吨): H_eff = 压力×102 − (液位−2.35), kwt = 272.5×H_eff/效率
+        pressure_arr = np.atleast_1d(np.asarray(pressure, dtype=np.float64))
+        level_arr = np.atleast_1d(np.asarray(level, dtype=np.float64))
+        H_eff = pressure_arr * 102 - (level_arr - PUMP_LEVEL)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            kwt = np.where((efficiency > 0) & (H_eff > 0),
+                           KWT_COEF * H_eff / efficiency, 0.0)
+
         if total_flow.shape[0] == 1:
             return (float(flow_170_1[0]), float(flow_170_2[0]),
-                    float(flow_703[0]), float(total_flow[0]), float(efficiency[0]))
-        return flow_170_1, flow_170_2, flow_703, total_flow, efficiency
+                    float(flow_703[0]), float(total_flow[0]), float(efficiency[0]),
+                    float(kwt[0]))
+        return flow_170_1, flow_170_2, flow_703, total_flow, efficiency, kwt
 
     def combo_confidence(self, states):
         """
@@ -383,19 +402,19 @@ class PumpInference:
         同 predict(), 额外返回组合置信度 (出现过=高 1.0 / 未出现=低 0.0)。
 
         返回:
-            flow_170_1, flow_170_2, flow_703, total_flow, efficiency  (同 predict)
+            flow_170_1, flow_170_2, flow_703, total_flow, efficiency, kwt  (同 predict)
             confidence: 单样本返回 (conf, count); 多样本返回两个列表
         """
-        f1, f2, f3, total, eff = self.predict(states, freqs, pressure, level)
+        f1, f2, f3, total, eff, kwt = self.predict(states, freqs, pressure, level)
         conf = self.combo_confidence(states)
-        return f1, f2, f3, total, eff, conf
+        return f1, f2, f3, total, eff, kwt, conf
 
     def predict_detail(self, states, freqs, pressure, level):
         """
-        返回全部4维明细 + 总管值。pressure/level 含义同 predict()。
+        返回全部4维明细 + 总管值 + 千吨水电耗。pressure/level 含义同 predict()。
 
         返回:
-            detail:     dict {col_name: value}  4个明细
+            detail:     dict {col_name: value}  4个明细 + 'kwt' 千吨水电耗
             total_flow: 总管流量 (m3/h)
             efficiency: 总管效率 (%)
         """
@@ -412,6 +431,10 @@ class PumpInference:
 
         total_flow = float(out[0, 0] + out[0, 1] + out[0, 2])
         efficiency = float(out[0, 3])
+
+        # 千吨水电耗 (kWh/千吨): H_eff = 压力×102 − (液位−2.35), kwt = 272.5×H_eff/效率
+        H_eff = float(np.atleast_1d(pressure)[0]) * 102 - (float(np.atleast_1d(level)[0]) - PUMP_LEVEL)
+        detail['kwt'] = KWT_COEF * H_eff / efficiency if (efficiency > 0 and H_eff > 0) else 0.0
 
         return detail, total_flow, efficiency
 
@@ -493,7 +516,7 @@ if __name__ == '__main__':
             print("\n──── 第一组: 实际数据中出现过的组合 (按占比降序) ────")
         elif i == len(cases_appeared):
             print("\n──── 第二组: 实际数据中从未出现的组合 ────")
-        f1, f2, f3, total, eff, conf = model.predict_with_confidence(states, freqs, pressure, level)
+        f1, f2, f3, total, eff, kwt, conf = model.predict_with_confidence(states, freqs, pressure, level)
         combo = ''.join('1' if s else '0' for s in states)
         conf_txt = f"置信度: 高 (出现 {conf[1]:,} 次)" if conf[0] > 0 else "置信度: 低 (未出现过)"
 
@@ -508,7 +531,7 @@ if __name__ == '__main__':
         print(f"\n[{name}]  开启组合={combo}  压力={pressure}  液位={level}")
         print(f"  频率: {freqs}  |  {conf_txt}")
         print(f"  预测: 管1+管2={p12:7.0f}  管3={f3:6.0f} m3/h | "
-              f"总管={total:7.0f} m3/h | 效率={eff:5.1f}%")
+              f"总管={total:7.0f} m3/h | 效率={eff:5.1f}% | 千吨水电耗={kwt:6.1f} kWh")
         print(f"  理论: 管1+管2={t12:7.0f}  管3={t3:6.0f} m3/h")
         print(f"  偏差: 管1+管2={p12 - t12:+7.0f} m3/h ({pct(p12 - t12, t12)})  "
               f"管3={f3 - t3:+6.0f} m3/h ({pct(f3 - t3, t3)})")

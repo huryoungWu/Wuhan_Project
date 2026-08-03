@@ -5,16 +5,21 @@ pump_brute_force.py — 基于 pump_inference.py 推理接口的暴力寻优算�
 思路对齐 optimizer.py (暴力枚举 + 向量化批量评估 + 剪枝 + 按目标择优):
 
   搜索空间:
-    - 泵组合  : 2^7 = 128 种, 排除全关/全开, 可按目标流量约束开启台数 (同 optimizer.py)
+    - 泵组合  : 7 台泵全部处理, 2^7=128 种中合法 104 种 (同 optimizer.py 思路):
+                排除全关; 管线约束: 泵1/2/4/6 与 泵3/5/7 分属两线, 同线不能全部
+                同时开启 (禁 1111111 / 1101010 / 0010101 等 23 种, 6~7 台组合
+                因必然一线全开而被全部排除, 合法组合上限 5 台)
     - 频率    : 30~50 Hz 步长 1 Hz (即 optimizer.py 中的"转速"; 泵6/泵7 默认工频恒 50 Hz)
     - 压力    : 0.24~0.36 MPa 步长 0.01
     - 液位    : 1~3 m 步长 0.5
   评估: 全部经 PumpInference.predict 批量推理 ((n,7) 批量, 等价 optimizer.py 的 predict_batch)
   剪枝: 流量>0, 效率∈(eff_range), 可选流量上限校验 (相似定律额定流量之和)
   择优: 按目标流量分组 (容差 1.5×流量步长) → 每泵组合取效率最高 → 时间序列相邻点复用
+  性能: 每 (压力,液位) 条件推理 6.3M 行 (GPU 实测 ~14.5s)
+        → 单点查询 ~15s, demo(6条件) ~90s, 全量建表(65条件) ~16 分钟
 
-  千吨水电耗: v6 模型只输出效率, 不输出功率 → 按 optimizer.py 口径由效率换算:
-    H_eff = 压力×102 − (液位−2.35) (m);  kwt = 272.5 × H_eff / 效率%  (kWh/千吨)
+  千吨水电耗: 由 pump_inference 的 predict 系列函数直接输出
+    (kwt = 272.5 × H_eff / 效率%, H_eff = 压力×102 − (液位−2.35)), 寻优算法直接消费
 
   目标流量范围依据 merged_minute_all.csv 实测 (3.6M 条):
     总管流量 P1=1676, P50=2720, P99=3675, max=4032 m³/h → 寻优范围 1700~3700 步长 100
@@ -42,7 +47,7 @@ from pump_inference import PumpInference
 
 # 结果目录: 基于脚本所在位置, 不依赖运行时的当前工作目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR = os.path.join(BASE_DIR, "results")
+RESULTS_DIR = os.path.join(BASE_DIR, "output")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
@@ -83,20 +88,15 @@ class PumpBruteForceOptimizer:
         model_path       : 推理权重路径, None 用默认 models/model_v2_combo_split.pt
         freq_min/max/step: 变频泵频率档位 (默认 30~50 Hz 步长 1)
         fixed_pumps      : 工频泵索引 (默认 {5,6} → P6/P7 恒 50 Hz, 依据真实数据直方图)
-        flow_per_pump    : 台数约束系数 num_active = int(target_flow / flow_per_pump) + 1
-        eff_range        : 效率过滤区间 (%, 默认 40~90, 对齐 optimizer.py 的 0.4~0.9)
-        min/max_active_pumps: 开启台数上下限 (默认 2~6; 全开不可行, 最少两台运行)
-        count_band       : 台数搜索带宽 (±band 台, 默认 1)
-                           模型实际流量常低于相似定律估计, 精确台数约束易漏解
+        eff_range        : 效率过滤区间 (%, 默认 30~90)
         chunk_size       : 单批推理行数上限 (防内存爆)
+
+    搜索范围: 7 台泵全部处理, 无台数约束, 枚举全部合法组合 (104 种, 见模块 docstring)
     """
     def __init__(self, model_path=None,
                  freq_min=30, freq_max=50, freq_step=1,
                  fixed_pumps=(5, 6),
-                 flow_per_pump=1300.0,   # 模型单泵实际容量 600~1900, 按均值定台数约束
-                 eff_range=(40.0, 90.0),
-                 min_active_pumps=2, max_active_pumps=6,
-                 count_band=1,
+                 eff_range=(30.0, 90.0),
                  chunk_size=200000):
         self.model = PumpInference(model_path)
 
@@ -109,63 +109,51 @@ class PumpBruteForceOptimizer:
             else:
                 self.speed_ranges[i] = self.vfd_levels
 
-        self.flow_per_pump = flow_per_pump
         self.eff_range = eff_range
-        self.min_active_pumps = min_active_pumps
-        self.max_active_pumps = max_active_pumps
-        self.count_band = count_band
         self.chunk_size = chunk_size
 
         # 泵额定流量 (m3/h @ 50Hz, 取自 pump_inference.py 演示的相似定律基准)
         self.rated_flows = np.array([2020, 670, 2020, 1260, 670, 1260, 670], dtype=np.float64)
 
-        # 千吨水电耗换算 (同 optimizer.py): kwt = 272.5 × H_eff / 效率%
-        self.pump_level = 2.35   # optimizer.py PUMP_LEVEL 基准液位
+        # 千吨水电耗换算实现在 pump_inference.PumpInference.kwt_from_eff, 直接调用
 
-        # (pressure, level, num_active) → [(combo, flows, effs, conf, max_rated_flow), ...] 缓存
+        # (pressure, level) → [(combo, flows, effs, kwts, conf, max_rated_flow), ...] 缓存
         self._eval_cache = {}
+        self._valid_combos_cache = None
+
+    # 物理管线约束: 泵1/2/4/6 在 A 管线, 泵3/5/7 在 B 管线, 同一管线不能全部同时开启
+    #   → 禁 1111111 (A全开+B全开), 1101010 (A全开), 0010101 (B全开)
+    PIPE_A = (0, 1, 3, 5)
+    PIPE_B = (2, 4, 6)
+
+    def _is_valid_combo(self, states):
+        """管线约束: A 组不全为1 且 B 组不全为1"""
+        if all(states[i] == 1 for i in self.PIPE_A):
+            return False
+        if all(states[i] == 1 for i in self.PIPE_B):
+            return False
+        return True
 
     # ====================== 泵组合生成 ======================
-    def generate_pump_combinations(self, target_flow=None):
+    def generate_pump_combinations(self):
         """
-        生成有效泵组合 (同 optimizer.py generate_valid_combinations):
-          - 排除全关 / 全开 (物理不可行)
-          - 可选: 按目标流量约束开启台数 num_active = int(flow / flow_per_pump) + 1
+        生成全部合法泵组合 (无台数约束, 7 台泵全部处理):
+          - 排除全关
+          - 管线约束: 泵1/2/4/6 与 泵3/5/7 分属两线, 同线不能全部同时开启
+            6~7 台组合因必然一线全开而被全部排除, 合法上限 5 台
+        返回: 104 种组合的 list
         """
-        if target_flow is not None:
-            num_active = max(self.min_active_pumps,
-                             min(self.max_active_pumps,
-                                 int(target_flow / self.flow_per_pump) + 1))
-        else:
-            num_active = None
-
-        combos = []
-        for bits in itertools.product([0, 1], repeat=7):
-            s = tuple(bits)
-            n = sum(s)
-            if n == 0:                    # 全关
-                continue
-            if n == 7:                    # 全开 (七台不能同时全开)
-                continue
-            if num_active is not None and n != num_active:
-                continue
-            combos.append(s)
-        return combos
-
-    def _combos_with_count(self, num_active):
-        combos = []
-        for bits in itertools.product([0, 1], repeat=7):
-            s = tuple(bits)
-            if sum(s) == num_active:
+        if self._valid_combos_cache is None:
+            combos = []
+            for bits in itertools.product([0, 1], repeat=7):
+                s = tuple(bits)
+                if sum(s) == 0:           # 全关
+                    continue
+                if not self._is_valid_combo(s):
+                    continue
                 combos.append(s)
-        return combos
-
-    def _flow_to_counts(self, target_flow):
-        """目标流量 → 需要搜索的台数集合 (公式台数 ± count_band, 夹在上下限内)"""
-        num = int(target_flow / self.flow_per_pump) + 1
-        lo = max(self.min_active_pumps, num - self.count_band)
-        hi = min(self.max_active_pumps, num + self.count_band)
-        return range(lo, hi + 1)
+            self._valid_combos_cache = combos
+        return self._valid_combos_cache
 
     # ====================== 转速矩阵生成 (缓存) ======================
     def _build_speed_matrix(self, states):
@@ -188,30 +176,32 @@ class PumpBruteForceOptimizer:
 
     # ====================== 批量推理 ======================
     def _predict_chunks(self, states, speed_matrix, pressure, level):
-        """分块调用推理接口 (等价 optimizer.py 的 batch_predict)"""
+        """分块调用推理接口 (等价 optimizer.py 的 batch_predict); kwt 由 predict 直接输出"""
         N = len(speed_matrix)
         states_tile = np.tile(np.asarray(states, dtype=np.int64), (N, 1))
         flows = np.zeros(N, dtype=np.float64)
         effs = np.zeros(N, dtype=np.float64)
+        kwts = np.zeros(N, dtype=np.float64)
         for s in range(0, N, self.chunk_size):
             e = min(s + self.chunk_size, N)
-            _, _, _, tot, eff = self.model.predict(
+            _, _, _, tot, eff, kwt = self.model.predict(
                 states_tile[s:e], speed_matrix[s:e], pressure, level)
             flows[s:e] = tot
             effs[s:e] = eff
-        return flows, effs
+            kwts[s:e] = kwt
+        return flows, effs, kwts
 
-    # ====================== 单条件评估 (压力, 液位, 台数) ======================
-    def evaluate_condition(self, pressure, level, num_active, validate_flow_limit=True):
+    # ====================== 单条件评估 (压力, 液位, 全部合法组合) ======================
+    def evaluate_condition(self, pressure, level, validate_flow_limit=True):
         """
-        评估 (压力, 液位) 下所有开启 num_active 台的泵组合 × 频率档位组合。
-        返回 [(states, flows, effs, confidence, appear_count, max_rated_flow), ...]
+        评估 (压力, 液位) 下全部合法泵组合 (104 种) × 频率档位组合。
+        返回 [(states, speed_matrix, flows, effs, kwts, conf, count, max_rated_flow), ...]
         """
-        key = (round(float(pressure), 4), round(float(level), 3), int(num_active))
+        key = (round(float(pressure), 4), round(float(level), 3))
         if key in self._eval_cache:
             return self._eval_cache[key]
 
-        combos = self._combos_with_count(num_active)
+        combos = self.generate_pump_combinations()
         results = []
         total_rows = 0
         for states in combos:
@@ -220,7 +210,7 @@ class PumpBruteForceOptimizer:
                 continue
             total_rows += N
 
-            flows, effs = self._predict_chunks(states, speed_matrix, pressure, level)
+            flows, effs, kwts = self._predict_chunks(states, speed_matrix, pressure, level)
 
             # ---- 过滤: 流量>0, 效率∈(eff_range), 可选流量上限 ----
             mask = (flows > 0) & (effs > self.eff_range[0]) & (effs <= self.eff_range[1])
@@ -232,44 +222,48 @@ class PumpBruteForceOptimizer:
 
             conf, count = self.model.combo_confidence(states)
 
-            results.append((states, speed_matrix, flows, effs, conf, count, mrf))
+            results.append((states, speed_matrix, flows, effs, kwts, conf, count, mrf))
             gc.collect()
 
-        print(f"  压力 {pressure} 液位 {level} 台数 {num_active}: "
+        print(f"  压力 {pressure} 液位 {level}: "
               f"{len(combos)} 个泵组合 × {total_rows:,} 行推理完成")
         self._eval_cache[key] = results
         return results
 
-    def kwt_from_eff(self, pressure, level, eff_percent):
-        """效率(%) → 千吨水电耗 (kWh/千吨): kwt = 272.5 × H_eff / 效率%
-        H_eff = 压力×102 − (液位−2.35), 同 optimizer.py 有效扬程口径"""
-        H_eff = pressure * 102 - (level - self.pump_level)
-        if H_eff <= 0:
-            return 0.0
-        return 272.5 * H_eff / eff_percent
-
     # ====================== 按目标流量择优 (对齐 optimizer.py) ======================
-    def _best_per_combo_for_flow(self, results, target_flow, tolerance, pressure, level):
+    def _best_per_combo_for_flow(self, results, target_flow, tolerance):
         """
         每组结果中取与 target_flow 误差 ≤ tolerance 的效率最高行;
         该流量下无匹配 → 取全局最近一行 (fallback)。
+        kwt 直接取 predict 输出的对应行。
         """
         best_rows = []
-        for states, speed_matrix, flows, effs, conf, count, mrf in results:
+        for states, speed_matrix, flows, effs, kwts, conf, count, mrf in results:
             diff = np.abs(flows - target_flow)
             within = diff <= tolerance
             if np.any(within):
                 idx = np.where(within)[0][int(np.argmax(effs[within]))]
             else:
                 idx = int(np.argmin(diff))     # fallback: 最近流量
-            eff_val = float(effs[idx])
+            dev = float(flows[idx] - target_flow)
+            # 偏差置信度: 容差内 1.0→0.8 (越接近目标越接近 1), 容差~2倍容差 0.8→0, 之外 0
+            abs_dev = abs(dev)
+            if abs_dev <= tolerance:
+                dev_conf = 1.0 - 0.2 * abs_dev / tolerance
+            elif abs_dev <= 2 * tolerance:
+                dev_conf = 0.8 * (1 - (abs_dev - tolerance) / tolerance)
+            else:
+                dev_conf = 0.0
             best_rows.append({
                 'states': list(states),
                 'freqs': speed_matrix[idx].tolist(),   # 转速矩阵第 idx 行即最优频率组合
                 'total_flow': float(flows[idx]),
-                'efficiency': eff_val,
-                'kwt': self.kwt_from_eff(pressure, level, eff_val),
-                'confidence': float(conf),
+                'efficiency': float(effs[idx]),
+                'kwt': float(kwts[idx]),
+                'flow_deviation': dev,
+                'confidence': float(conf),             # 组合置信度 (真实出现过=1.0/未出现=0.0)
+                'dev_confidence': dev_conf,            # 偏差置信度
+                'total_confidence': (dev_conf + float(conf)) / 2.0,  # 总置信度 = 两者平均
                 'appear_count': int(count),
                 'max_rated_flow': float(mrf),
             })
@@ -307,11 +301,8 @@ class PumpBruteForceOptimizer:
                 last_flow = target_flow
                 continue
 
-            best_rows = []
-            for num_active in self._flow_to_counts(target_flow):
-                results = self.evaluate_condition(pressure, level, num_active)
-                best_rows += self._best_per_combo_for_flow(results, target_flow, tolerance,
-                                                           pressure, level)
+            results = self.evaluate_condition(pressure, level)
+            best_rows = self._best_per_combo_for_flow(results, target_flow, tolerance)
 
             if best_rows:
                 # 择优: 容差内有解 → 取效率最高; 无解 → 取偏差最小 (避免远端高效行误导)
@@ -322,7 +313,6 @@ class PumpBruteForceOptimizer:
                 else:
                     best = min(best_rows,
                                key=lambda r: abs(r['total_flow'] - target_flow))
-                best['flow_deviation'] = best['total_flow'] - target_flow
                 best['pressure'] = pressure
                 best['target_flow'] = target_flow
                 best['level'] = level
@@ -332,8 +322,8 @@ class PumpBruteForceOptimizer:
                       f"流量={best['total_flow']:.0f} (偏差 {best['flow_deviation']:+.0f}), "
                       f"效率={best['efficiency']:.1f}%, "
                       f"千吨水电耗={best['kwt']:.1f} kWh, "
-                      f"置信度={'高' if best['confidence'] > 0 else '低'} "
-                      f"(出现 {best['appear_count']:,} 次)")
+                      f"组合置信度={'高' if best['confidence'] > 0 else '低'} "
+                      f"(出现 {best['appear_count']:,} 次), 总置信度={best['total_confidence']:.2f}")
                 all_solutions.append([best])
                 last_solution = [best]
             else:
@@ -348,7 +338,8 @@ class PumpBruteForceOptimizer:
                     all_solutions.append([{
                         'states': [0] * 7, 'freqs': [0.0] * 7,
                         'total_flow': 0.0, 'efficiency': 0.0,
-                        'confidence': 0.0, 'appear_count': 0,
+                        'confidence': 0.0, 'dev_confidence': 0.0,
+                        'total_confidence': 0.0, 'appear_count': 0,
                         'flow_deviation': -target_flow,
                         'pressure': pressure, 'target_flow': target_flow,
                         'level': level, 'reused': 0,
@@ -364,7 +355,8 @@ class PumpBruteForceOptimizer:
                              'Pump_Group',
                              *[f'P{i}_Freq' for i in range(1, 8)],
                              'Total_Flow', 'Flow_Deviation', 'Eff', 'PCTW',
-                             'Confidence', 'Appear_Count', 'Reused'])
+                             'Confidence', 'Dev_Confidence', 'Total_Confidence',
+                             'Appear_Count', 'Reused'])
             for i, sol in enumerate(all_solutions):
                 s = sol[0]
                 row = [i + 1, s.get('pressure', ''), s.get('target_flow', ''),
@@ -373,7 +365,10 @@ class PumpBruteForceOptimizer:
                        *[int(round(f)) for f in s['freqs']],
                        round(s['total_flow'], 1), round(s.get('flow_deviation', 0), 1),
                        round(s['efficiency'], 2), round(s.get('kwt', 0), 2),
-                       s['confidence'], s['appear_count'],
+                       round(s.get('confidence', 0), 2),
+                       round(s.get('dev_confidence', 0), 2),
+                       round(s.get('total_confidence', 0), 2),
+                       s['appear_count'],
                        s.get('reused', 0)]
                 writer.writerow(row)
         print(f"查询结果已写入: {csv_path}")
@@ -388,7 +383,7 @@ class PumpBruteForceOptimizer:
           对每个 (压力, 液位): 对每个目标流量 → 按台数约束枚举 → 每泵组合取效率最高行
         CSV 列: Header_Press, Liquid_Level, Flow_Lower/Upper, Pump_Group,
                 P1_Freq~P7_Freq, Total_Flow, Flow_Deviation, Eff, PCTW,
-                Confidence, Appear_Count
+                Confidence(组合), Dev_Confidence(偏差), Total_Confidence(平均), Appear_Count
         """
         if csv_path is None:
             csv_path = os.path.join(RESULTS_DIR,
@@ -402,15 +397,9 @@ class PumpBruteForceOptimizer:
         cols = (['Header_Press', 'Liquid_Level', 'Flow_Lower', 'Flow_Upper', 'Pump_Group']
                 + [f'P{i}_Freq' for i in range(1, 8)]
                 + ['Total_Flow', 'Flow_Deviation', 'Eff', 'PCTW',
-                   'Confidence', 'Appear_Count'])
+                   'Confidence', 'Dev_Confidence', 'Total_Confidence', 'Appear_Count'])
         total_rows = 0
         header_written = False
-
-        # 台数约束去重: 每个 num_active 只评估一次 (同 query, 支持 count_band)
-        num_to_flows = {}
-        for tf in target_flows:
-            for num in self._flow_to_counts(tf):
-                num_to_flows.setdefault(num, []).append(tf)
 
         n_conditions = len(pressures) * len(levels)
         bar = ProgressBar(n_conditions, description="建表进度")
@@ -425,29 +414,30 @@ class PumpBruteForceOptimizer:
             for pressure in pressures:
                 for level in levels:
                     print(f"\n压力 {pressure} MPa, 液位 {level} m:")
-                    for num, tfs in sorted(num_to_flows.items()):
-                        results = self.evaluate_condition(pressure, level, num, validate_flow_limit)
-                        for tf in tfs:
-                            best_rows = self._best_per_combo_for_flow(results, tf, tolerance,
-                                                                      pressure, level)
-                            for r in best_rows:
-                                row = {
-                                    'Header_Press': round(pressure, 3),
-                                    'Liquid_Level': round(level, 1),
-                                    'Flow_Lower': round(tf - tolerance / 1.5, 1),
-                                    'Flow_Upper': round(tf + tolerance / 1.5, 1),
-                                    'Pump_Group': ''.join(map(str, r['states'])),
-                                }
-                                for i in range(7):
-                                    row[f'P{i + 1}_Freq'] = int(round(r['freqs'][i]))
-                                row['Total_Flow'] = round(r['total_flow'], 1)
-                                row['Flow_Deviation'] = round(r['total_flow'] - tf, 1)
-                                row['Eff'] = round(r['efficiency'], 2)
-                                row['PCTW'] = round(r['kwt'], 2)
-                                row['Confidence'] = r['confidence']
-                                row['Appear_Count'] = r['appear_count']
-                                writer.writerow(row)
-                                total_rows += 1
+                    # 每个 (压力, 液位) 条件评估一次全部合法组合, 所有流量档共享
+                    results = self.evaluate_condition(pressure, level, validate_flow_limit)
+                    for tf in target_flows:
+                        best_rows = self._best_per_combo_for_flow(results, tf, tolerance)
+                        for r in best_rows:
+                            row = {
+                                'Header_Press': round(pressure, 3),
+                                'Liquid_Level': round(level, 1),
+                                'Flow_Lower': round(tf - tolerance / 1.5, 1),
+                                'Flow_Upper': round(tf + tolerance / 1.5, 1),
+                                'Pump_Group': ''.join(map(str, r['states'])),
+                            }
+                            for i in range(7):
+                                row[f'P{i + 1}_Freq'] = int(round(r['freqs'][i]))
+                            row['Total_Flow'] = round(r['total_flow'], 1)
+                            row['Flow_Deviation'] = round(r['total_flow'] - tf, 1)
+                            row['Eff'] = round(r['efficiency'], 2)
+                            row['PCTW'] = round(r['kwt'], 2)
+                            row['Confidence'] = r['confidence']
+                            row['Dev_Confidence'] = round(r['dev_confidence'], 2)
+                            row['Total_Confidence'] = round(r['total_confidence'], 2)
+                            row['Appear_Count'] = r['appear_count']
+                            writer.writerow(row)
+                            total_rows += 1
                     self._eval_cache.clear()
                     bar.update(1)
             bar.finish()
@@ -460,8 +450,7 @@ class PumpBruteForceOptimizer:
         print("PumpBruteForceOptimizer")
         print(f"  频率档位: 变频泵 {self.vfd_levels[0]:.0f}~{self.vfd_levels[-1]:.0f} Hz 步长 "
               f"{self.vfd_levels[1] - self.vfd_levels[0]:.0f}, 工频泵恒 50 Hz")
-        print(f"  台数约束: num_active = int(流量/{self.flow_per_pump:.0f}) + 1, "
-              f"范围 [{self.min_active_pumps}, {self.max_active_pumps}]")
+        print(f"  泵组合: 7 台泵全部处理, 管线约束过滤后 {len(self.generate_pump_combinations())} 种合法组合")
         print(f"  效率过滤: {self.eff_range[0]}% < 效率 ≤ {self.eff_range[1]}%")
         print(f"  批量推理分块: {self.chunk_size:,} 行/批")
         self.model.info()
@@ -481,7 +470,8 @@ if __name__ == '__main__':
         s = sol[0]
         print(f"  时间点{i + 1}: 组合={''.join(map(str, s['states']))} "
               f"频率={[int(f) for f in s['freqs']]} 流量={s['total_flow']:.0f} "
-              f"效率={s['efficiency']:.1f}% 千吨水电耗={s['kwt']:.1f} kWh")
+              f"效率={s['efficiency']:.1f}% 千吨水电耗={s['kwt']:.1f} kWh "
+              f"总置信度={s['total_confidence']:.2f}")
 
     # 2) 离线建表 (小网格, 全量网格见注释; 默认写入 results/ 带时间戳)
     opt.build_lookup_table(
@@ -489,7 +479,7 @@ if __name__ == '__main__':
         target_flows=list(range(2200, 3701, 100)),   # 与全量网格同一步长
         levels=[2.0, 3.0],
     )
-    # 全量网格 (覆盖实测流量 P1~P99 = 1676~3675, 步长 100 → 容差 ±150, 约 1~2 小时):
+    # 全量网格 (覆盖实测流量 P1~P99 = 1676~3675, 步长 100 → 容差 ±150, 实测约 9 分钟):
     # opt.build_lookup_table(
     #     pressures=np.arange(0.24, 0.3601, 0.01).tolist(),
     #     target_flows=list(range(1700, 3701, 100)),
