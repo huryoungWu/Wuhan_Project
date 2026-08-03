@@ -99,3 +99,41 @@ with open(r"D:\Wuhan_Project\metrics_statistics_per_indicator.csv", "w", newline
             n, mean, med, var, sd, mn, mx = stats(d[met])
             w.writerow([met, ind, n, round(mean, 4), round(med, 4), round(var, 4), round(sd, 4), round(mn, 4), round(mx, 4)])
 print("\n已保存: metrics_statistics_per_indicator.csv")
+
+# ================= 分布直方图 (三个流量 + 一个效率) =================
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "SimSun"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
+    target_inds = ["170:1_瞬时流量", "170:2_瞬时流量", "70:3_瞬时流量", "flowtotal(总和)", "总管效率_pct"]
+    metrics = ["MAE", "RMSE", "MAPE"]
+    units = {"MAE": "m³/h", "RMSE": "m³/h", "MAPE": "%"}
+
+    fig, axes = plt.subplots(len(target_inds), len(metrics),
+                             figsize=(4.2 * len(metrics), 3.2 * len(target_inds)))
+    for i, ind in enumerate(target_inds):
+        for j, met in enumerate(metrics):
+            ax = axes[i, j]
+            vals = data.get(ind, {}).get(met, [])
+            if not vals:
+                ax.set_title(f"{ind} · {met} (无数据)", fontsize=9)
+                continue
+            n, mean, med, var, sd, mn, mx = stats(vals)
+            ax.hist(vals, bins=min(20, len(vals)), edgecolor="white", alpha=0.8, color=f"C{j}")
+            ax.axvline(mean, color="red", ls="--", lw=1.2, label=f"均值 {mean:.4g}")
+            ax.axvline(med, color="blue", ls=":", lw=1.2, label=f"中位数 {med:.4g}")
+            ax.set_title(f"{ind} · {met} (n={n}, σ={sd:.4g})", fontsize=9)
+            ax.set_xlabel(f"{met} ({units[met]})", fontsize=8)
+            if j == 0:
+                ax.set_ylabel("频次", fontsize=8)
+            ax.legend(fontsize=7)
+    fig.tight_layout()
+    out_png = r"D:\Wuhan_Project\results\metrics_distribution_histograms.png"
+    fig.savefig(out_png, dpi=150)
+    print(f"\n已保存直方图: {out_png}")
+except ImportError:
+    print("\n未安装 matplotlib, 跳过直方图绘制")

@@ -1,4 +1,4 @@
-git add pump_optimize_PSO.py"""
+"""
 水泵开启策略寻优 — 粒子群优化 (PSO) (基于 pump_inference.PumpInference 接口)
 
 给定目标工况, 反向推导"效率最优"的水泵开启/频率策略:
@@ -26,6 +26,9 @@ git add pump_optimize_PSO.py"""
   - 模型是数据驱动的代理模型, 寻优结果作为运行建议, 上线前需结合实际工况校核
   - 种群大小不要设为 7 (推理脚本会把 n==7 误判为单样本而平铺频率)
 """
+
+import sys
+import time
 
 import numpy as np
 
@@ -68,11 +71,19 @@ def decode(genes, pressure_target):
     return states, freqs, pressure
 
 
-def evaluate(model, genes, target_flows, pressure_target, level):
-    """批量评估适应度: fitness = 效率 - PENALTY * 总超差量 (m3/h)"""
+def evaluate(model, genes, target_flows, pressure_target, level, stats=None):
+    """批量评估适应度: fitness = 效率 - PENALTY * 总超差量 (m3/h)
+
+    stats: 推理耗时统计字典 (可选) — {'n_calls', 'n_samples', 'infer_time'}
+    """
     states, freqs, pressure = decode(genes, pressure_target)
+    t0 = time.perf_counter()
     # v6 返回 6 个值: f1, f2, f3, total_flow, eff, kwt
     f1, f2, f3, total_flow, eff, kwt = model.predict(states, freqs, pressure, level)
+    if stats is not None:
+        stats['n_calls'] += 1
+        stats['n_samples'] += genes.shape[0]
+        stats['infer_time'] += time.perf_counter() - t0
     f1, f2, f3, eff = map(np.atleast_1d, (f1, f2, f3, eff))
     pred_flows = np.column_stack([f1, f2, f3])
     violation = np.sum(np.maximum(np.abs(pred_flows - np.asarray(target_flows)) - FLOW_TOL, 0.0),
@@ -92,10 +103,14 @@ def optimize_strategy(model, target_flows, pressure, level,
     rng = np.random.default_rng(seed)
     dim = 2 * N_PUMPS + 1
 
+    # 推理耗时统计
+    stats = {'n_calls': 0, 'n_samples': 0, 'infer_time': 0.0}
+    t_start = time.perf_counter()
+
     # 初始化
     positions = rng.random((pop_size, dim))
     velocities = rng.uniform(-0.1, 0.1, (pop_size, dim))
-    fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level)
+    fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level, stats)
     pbest_positions = positions.copy()
     pbest_fitness = fitness.copy()
     gbest_idx = np.argmax(fitness)
@@ -124,7 +139,7 @@ def optimize_strategy(model, target_flows, pressure, level,
             reset_idx = rng.choice(pop_size, n_reset, replace=False)
             positions[reset_idx] = rng.random((n_reset, dim))
             velocities[reset_idx] = rng.uniform(-0.1, 0.1, (n_reset, dim))
-            fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level)
+            fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level, stats)
 
         for i in range(pop_size):
             r1 = rng.random(dim)
@@ -136,7 +151,7 @@ def optimize_strategy(model, target_flows, pressure, level,
             positions[i] = positions[i] + velocities[i]
             positions[i] = np.clip(positions[i], 0.0, 1.0)
 
-        fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level)
+        fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level, stats)
 
         for i in range(pop_size):
             if fitness[i] > pbest_fitness[i]:
@@ -165,7 +180,11 @@ def optimize_strategy(model, target_flows, pressure, level,
                          0.0)
         pressure_used = pressure + (pos[-1] * 2 - 1) * PRESSURE_TOL
         # v6 返回 6 个值
+        t0 = time.perf_counter()
         f1, f2, f3, total_flow, eff, kwt = model.predict(states, freqs, pressure_used, level)
+        stats['n_calls'] += 1
+        stats['n_samples'] += 1
+        stats['infer_time'] += time.perf_counter() - t0
         pred_flows = np.array([f1, f2, f3])
         deviation = np.abs(pred_flows - target_flows)
         violation = float(np.sum(np.maximum(deviation - FLOW_TOL, 0.0)))
@@ -196,7 +215,11 @@ def optimize_strategy(model, target_flows, pressure, level,
                              0.0)
             pressure_used = pressure + (pos[-1] * 2 - 1) * PRESSURE_TOL
             # v6 返回 6 个值
+            t0 = time.perf_counter()
             f1, f2, f3, total_flow, eff, kwt = model.predict(states, freqs, pressure_used, level)
+            stats['n_calls'] += 1
+            stats['n_samples'] += 1
+            stats['infer_time'] += time.perf_counter() - t0
             pred_flows = np.array([f1, f2, f3])
             deviation = np.abs(pred_flows - target_flows)
             violation = float(np.sum(np.maximum(deviation - FLOW_TOL, 0.0)))
@@ -219,12 +242,22 @@ def optimize_strategy(model, target_flows, pressure, level,
     candidates = sorted(candidates, key=lambda x: x['efficiency'], reverse=True)
 
     best = candidates[0]
+    elapsed = time.perf_counter() - t_start
     best.update({
         'target_flows': target_flows,
         'pressure_target': float(pressure),
         'level': float(level),
         'candidates': candidates,
         'num_unique_states': len(candidates),
+        # 推理耗时统计
+        'timing': {
+            'total_s': elapsed,                       # 寻优总耗时 (s)
+            'n_calls': stats['n_calls'],              # predict 调用次数
+            'n_samples': stats['n_samples'],          # 推理样本总数
+            'infer_total_s': stats['infer_time'],     # 模型推理总耗时 (s)
+            'infer_per_call_ms': stats['infer_time'] / stats['n_calls'] * 1000.0,
+            'infer_per_sample_ms': stats['infer_time'] / stats['n_samples'] * 1000.0,
+        },
     })
     return best
 
@@ -253,6 +286,73 @@ def print_result(result):
               f"70:3={cand['pred_flows'][2]:.1f} m3/h")
         print(f"  偏差:    {' '.join(f'{d:+.1f}' for d in cand['deviation'])} m3/h (容差 ±{FLOW_TOL:.0f})")
         print(f"  总管流量: {cand['total_flow']:.1f} m3/h")
+
+    # 推理耗时
+    timing = result.get('timing')
+    if timing:
+        print("\n" + "-" * 72)
+        print(f"⏱ 推理耗时: 共 {timing['n_calls']} 次推理调用 / {timing['n_samples']} 个样本, "
+              f"推理总耗时 {timing['infer_total_s']:.2f}s "
+              f"(单次调用平均 {timing['infer_per_call_ms']:.1f} ms, "
+              f"单样本平均 {timing['infer_per_sample_ms']:.3f} ms)")
+        print(f"⏱ 寻优总耗时: {timing['total_s']:.1f}s")
+
+
+# ============================================================================
+# 单样本推理耗时基准
+# ============================================================================
+
+def benchmark_inference(model, n_calls=1000, pressure=0.42, level=3.42, seed=42):
+    """
+    单样本推理耗时基准: 每次 predict 只测 1 个样本, 重复 n_calls 次。
+
+    返回统计字典:
+      mean_ms / min_ms / max_ms / p50_ms / p95_ms — 单次调用耗时 (ms)
+      var_ms2 / std_ms          — 方差 (ms²) / 标准差 (ms)
+      total_s                   — 总耗时 (s)
+    """
+    rng = np.random.default_rng(seed)
+    states = (rng.random(N_PUMPS) > 0.5).astype(np.int64)
+    freqs = np.where(states > 0,
+                     FREQ_MIN + rng.random(N_PUMPS) * (FREQ_MAX - FREQ_MIN), 0.0)
+
+    # 预热: 前 20 次调用不参与统计 (CUDA 初始化 / 线程池 / 缓存)
+    for _ in range(20):
+        model.predict(states, freqs, pressure, level)
+
+    times = np.empty(n_calls)
+    for i in range(n_calls):
+        t0 = time.perf_counter()
+        model.predict(states, freqs, pressure, level)
+        times[i] = time.perf_counter() - t0
+
+    ms = times * 1000.0
+    return {
+        'n_calls': n_calls,
+        'mean_ms': float(ms.mean()),
+        'min_ms': float(ms.min()),
+        'max_ms': float(ms.max()),
+        'p50_ms': float(np.percentile(ms, 50)),
+        'p95_ms': float(np.percentile(ms, 95)),
+        'var_ms2': float(ms.var()),
+        'std_ms': float(ms.std()),
+        'total_s': float(times.sum()),
+    }
+
+
+def print_benchmark(stats):
+    """打印单样本推理耗时基准结果"""
+    print("\n" + "=" * 72)
+    print(f"单样本推理耗时基准: {stats['n_calls']} 次调用 (每次 1 个样本)")
+    print("=" * 72)
+    print(f"  平均耗时: {stats['mean_ms']:.2f} ms")
+    print(f"  最小耗时: {stats['min_ms']:.2f} ms")
+    print(f"  最大耗时: {stats['max_ms']:.2f} ms")
+    print(f"  P50 耗时: {stats['p50_ms']:.2f} ms")
+    print(f"  P95 耗时: {stats['p95_ms']:.2f} ms")
+    print(f"  方差:     {stats['var_ms2']:.4f} ms²")
+    print(f"  标准差:   {stats['std_ms']:.2f} ms")
+    print(f"  总耗时:   {stats['total_s']:.2f} s")
 
 
 # ============================================================================
@@ -321,8 +421,12 @@ if __name__ == '__main__':
     except FileNotFoundError as e:
         print(f"\n❌ 错误: {e}")
         print("请检查模型文件路径是否正确")
-        import sys
         sys.exit(1)
+
+    # --benchmark: 单样本推理耗时基准 (1000 次调用, 每次 1 个样本)
+    if '--benchmark' in sys.argv:
+        print_benchmark(benchmark_inference(model))
+        sys.exit(0)
 
     # 获取用户输入
     user_input = get_user_input()
