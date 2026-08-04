@@ -53,7 +53,7 @@ if BASE_DIR not in sys.path:
 # 复用 train.py 中的模型训练 / 数据处理函数 (train.py 的主体在 __main__ 中,
 # import 不会触发训练流程)
 from train import (train_model, NumpyEncoder,
-                   correct_pressure, compute_pump_powers,
+                   correct_pressure,
                    compute_total_power_from_meters, compute_efficiency,
                    clean_pump_power)   # evaluate_by_combination 未用, 不引入
 
@@ -64,7 +64,7 @@ from train import (train_model, NumpyEncoder,
 RESULTS_DIR = os.path.join(BASE_DIR, "new_results")   # 输出目录 (自动创建)
 CACHE_PATH = r"D:\Wuhan_Project\new_data\processed_cache.parquet"
 DATA_PATH = r"D:\Wuhan_Project\new_data\merged_minute_all.csv"
-CACHE_VERSION = 'power_diff_v2'          # 与 train.py 相同的缓存版本标记
+CACHE_VERSION = 'power_clean_v1'          # 与 train.py 相同的缓存版本标记
 
 FREQ_DECIMALS = 1                        # 频率组合取整精度 (0.1Hz)
 FREQ_SPLIT_RATIO = 0.2                   # 测试集频率组合占比 20%
@@ -85,11 +85,11 @@ continuous_cols = [
     '170:总管压力',
 ]
 flow_cols = ['170:1_瞬时流量', '170:2_瞬时流量', '70:3_瞬时流量']
-power_output_cols = [
-    '泵1_功率_kVA', '泵2_功率_kVA', '泵3_功率_kVA',
-    '泵4_功率_kVA', '泵5_功率_kVA', '泵6_功率_kVA',
+meter_power_cols = [
+    '泵1_功率_kW', '泵2_功率_kW', '泵3_功率_kW',
+    '泵4_功率_kW', '泵5_功率_kW', '泵6_功率_kW',
     '泵7_功率_kW'
-]
+]   # 电度分钟差分功率列 (compute_total_power_from_meters 写入)
 power_freq_cols = [
     '170:1_运行频率', '170:2_运行频率', '170:3_运行频率',
     '170:4_运行频率', '170:5_运行频率', '170:6_运行频率',
@@ -166,10 +166,9 @@ def load_data():
 
     print(f"  清洗前: {n_before:,}, 清洗后: {len(df):,}, 剔除: {n_before-len(df):,}")
 
-    df = compute_pump_powers(df)
     df = compute_total_power_from_meters(df)
-    df = compute_efficiency(df, power_output_cols, flow_cols, pf_estimate=0.88, save_csv=True)
-    df, clean_stats = clean_pump_power(df, power_freq_cols, power_output_cols, mad_multiplier=3.5)
+    df = compute_efficiency(df, meter_power_cols, flow_cols, pf_estimate=0.88, save_csv=True)
+    df, clean_stats = clean_pump_power(df, power_freq_cols, meter_power_cols, mad_multiplier=3.5)
     print(f"单泵功率清洗: {clean_stats['total_before']:,} -> {clean_stats['total_after']:,}")
 
     df['_cache_version'] = CACHE_VERSION

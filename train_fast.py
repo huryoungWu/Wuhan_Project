@@ -43,7 +43,7 @@ import time
 # ============================================================================
 
 def compute_pump_powers(df):
-    """从三相电压/电流数据计算7个泵的功率。"""
+    """从三相电压/电流数据计算7个泵的功率 (已弃用, 功率以电度差分为准)。"""
     for pn in ['1', '2', '3', '4', '5', '6']:
         va_col = f'172:{pn}_泵A相电压'
         vb_col = f'172:{pn}_泵B相电压'
@@ -208,10 +208,14 @@ def compute_total_power_from_meters(df):
         pump_powers[f'泵{name}_功率_kW'] = p
         df[f'泵{name}_功率_kW'] = p
 
-    # 泵7: 瞬时有功 W → kW
+    # 泵7: 瞬时有功 W → kW (无电度表, 不差分, 直接取瞬时值)
     if '70:7_总有功' in df.columns:
-        pump_powers['泵7_功率_kW'] = (df['70:7_总有功'].fillna(0) / 1000).clip(lower=0, upper=200)
+        p7 = (df['70:7_总有功'].fillna(0) / 1000).clip(lower=0, upper=200)
+        df['泵7_功率_kW'] = p7
+        pump_powers['泵7_功率_kW'] = p7
     else:
+        print("  警告: 缺少 '70:7_总有功' 列, 泵7功率设为0")
+        df['泵7_功率_kW'] = 0.0
         pump_powers['泵7_功率_kW'] = 0.0
 
     # 总功率 (kW) → 平滑处理
@@ -1005,11 +1009,11 @@ if __name__ == '__main__':
         '170:总管压力',
     ]
     flow_cols = ['170:1_瞬时流量', '170:2_瞬时流量', '70:3_瞬时流量']
-    power_output_cols = [
-        '泵1_功率_kVA', '泵2_功率_kVA', '泵3_功率_kVA',
-        '泵4_功率_kVA', '泵5_功率_kVA', '泵6_功率_kVA',
+    meter_power_cols = [
+        '泵1_功率_kW', '泵2_功率_kW', '泵3_功率_kW',
+        '泵4_功率_kW', '泵5_功率_kW', '泵6_功率_kW',
         '泵7_功率_kW'
-    ]
+    ]   # 电度分钟差分功率列 (compute_total_power_from_meters 写入)
     power_freq_cols = [
         '170:1_运行频率', '170:2_运行频率', '170:3_运行频率',
         '170:4_运行频率', '170:5_运行频率', '170:6_运行频率',
@@ -1019,7 +1023,7 @@ if __name__ == '__main__':
 
     # ── Parquet 缓存：跳过重复的 CSV 加载和清洗 ──
     CACHE_PATH = r"D:\Wuhan_Project\new_data\processed_cache.parquet"
-    CACHE_VERSION = 'power_diff_v2'  # 功率口径: 分钟级差分 (修正秒级跳表脉冲)
+    CACHE_VERSION = 'power_clean_v1'  # 功率口径: 分钟级差分 + 单泵功率清洗基于电度差分功率列
     TRAIN_SAMPLE_SIZE = None  # 训练集最多采样数，None=不采样
 
     cache_usable = False
@@ -1152,16 +1156,15 @@ if __name__ == '__main__':
         n_after = len(df)
         print(f"  清洗前: {n_before:,}, 清洗后: {n_after:,}, 剔除: {n_before-n_after:,} ({100*(n_before-n_after)/n_before:.2f}%)")
 
-        # 计算功率 + 效率
-        df = compute_pump_powers(df)
+        # 计算功率 + 效率 (单泵功率列由 compute_total_power_from_meters 电度差分写入)
         df = compute_total_power_from_meters(df)        # 从累计电度差分计算总功率
-        df = compute_efficiency(df, power_output_cols, flow_cols,
+        df = compute_efficiency(df, meter_power_cols, flow_cols,
                                 pf_estimate=0.88, save_csv=True)
 
         # 单泵功率清洗 (向量化版)
         print("\n清洗单泵功率 (频率分段MAD离群检测)...")
         t_clean = time.time()
-        df, clean_stats = clean_pump_power(df, power_freq_cols, power_output_cols,
+        df, clean_stats = clean_pump_power(df, power_freq_cols, meter_power_cols,
                                             mad_multiplier=3.5)
         print(f"清洗: {clean_stats['total_before']:,} -> {clean_stats['total_after']:,} "
               f"(剔除 {clean_stats['total_removed']:,}, {clean_stats['total_removed']/clean_stats['total_before']*100:.2f}%) "
@@ -1173,7 +1176,7 @@ if __name__ == '__main__':
         df.to_parquet(CACHE_PATH, index=False)
 
     print(f"\n{'泵号':<6} {'运行点':<10} {'范围':<24} {'均值':<10} {'单位'}")
-    for pn, pcol in zip(['1','2','3','4','5','6','7'], power_output_cols):
+    for pn, pcol in zip(['1','2','3','4','5','6','7'], meter_power_cols):
         fc = power_freq_cols[int(pn)-1]
         mask = (df[fc] > 0) & (df[pcol] > 0)
         d = df.loc[mask, pcol]

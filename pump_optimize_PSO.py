@@ -11,6 +11,7 @@
 寻优 (粒子群优化):
   - 约束: 模型预测流量与目标流量偏差 ≤ ±100 m³/h
   - 目标: 满足约束的前提下, 预测总管效率最大化
+  - 频率: 强制整数 Hz (30~50, 共21档), 与现场变频器整数设定一致
 
 用法 (接口调用):
   from pump_inference import PumpInference
@@ -57,18 +58,39 @@ PSO_SEED = 42                # 随机种子
 
 # ============================================================================
 # 编码/解码: 每个个体 = [s1..s7 (0~1), f1..f7 (0~1), p (0~1)]
-#   s_i > 0.5 → 泵 i 开启; f_i → [FREQ_MIN, FREQ_MAX] Hz (停泵为0)
+#   s_i > 0.5 → 泵 i 开启; f_i → [FREQ_MIN, FREQ_MAX] Hz 整数档 (停泵为0)
 #   p       → 压力在 [目标-0.01, 目标+0.01] MPa 内微调
+#   频率基因解码时取整到整数 Hz (30~50, 共21档); 基因由 snap_freq_genes
+#   吸附到整数档位中心, 保证 pbest/gbest 吸引点与评估点一致 (见下)
 # ============================================================================
 
 def decode(genes, pressure_target):
-    """基因 → (泵状态, 频率, 压力). genes: (n, 15)"""
+    """基因 → (泵状态, 频率, 压力). genes: (n, 15)
+
+    频率取整到整数 Hz: freq = round(FREQ_MIN + gene × (FREQ_MAX−FREQ_MIN)),
+    即 30~50 Hz 共 21 档, 与现场变频器整数设定一致; 泵关闭 → 0。
+    """
     states = (genes[:, :N_PUMPS] > 0.5).astype(np.int64)
     freqs = np.where(states > 0,
-                     FREQ_MIN + genes[:, N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN),
+                     np.round(FREQ_MIN + genes[:, N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)),
                      0.0)
     pressure = pressure_target + (genes[:, -1] * 2 - 1) * PRESSURE_TOL
     return states, freqs, pressure
+
+
+def snap_freq_genes(genes):
+    """把频率基因吸附到整数档位中心, 使 pbest/gbest 吸引点与评估点一致。
+
+    解码已取整, 若 pbest/gbest 仍存连续位置 (如 41.7), 速度更新会把粒子拉向
+    41.7 这个"虚假最优" (实际评估的是 round 后的 42), 浪费搜索预算、粒子
+    聚集在整数点邻域而非整数点上。吸附后所有存储位置精确落在整数档位中心,
+    粒子直接收敛到整数频率点。状态/压力基因不受影响。
+    """
+    g = genes.copy()
+    freqs = FREQ_MIN + g[:, N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)
+    freqs_int = np.round(freqs)
+    g[:, N_PUMPS:2 * N_PUMPS] = (freqs_int - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)
+    return g
 
 
 def evaluate(model, genes, target_flows, pressure_target, level, stats=None):
@@ -107,8 +129,8 @@ def optimize_strategy(model, target_flows, pressure, level,
     stats = {'n_calls': 0, 'n_samples': 0, 'infer_time': 0.0}
     t_start = time.perf_counter()
 
-    # 初始化
-    positions = rng.random((pop_size, dim))
+    # 初始化 (频率基因先吸附到整数档位中心)
+    positions = snap_freq_genes(rng.random((pop_size, dim)))
     velocities = rng.uniform(-0.1, 0.1, (pop_size, dim))
     fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level, stats)
     pbest_positions = positions.copy()
@@ -137,7 +159,7 @@ def optimize_strategy(model, target_flows, pressure, level,
         if gen > 0 and gen % restart_interval == 0:
             n_reset = max(1, pop_size // 5)
             reset_idx = rng.choice(pop_size, n_reset, replace=False)
-            positions[reset_idx] = rng.random((n_reset, dim))
+            positions[reset_idx] = snap_freq_genes(rng.random((n_reset, dim)))
             velocities[reset_idx] = rng.uniform(-0.1, 0.1, (n_reset, dim))
             fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level, stats)
 
@@ -151,6 +173,8 @@ def optimize_strategy(model, target_flows, pressure, level,
             positions[i] = positions[i] + velocities[i]
             positions[i] = np.clip(positions[i], 0.0, 1.0)
 
+        # 频率基因吸附回整数档位中心, 再统一评估 (吸引点与评估点一致)
+        positions = snap_freq_genes(positions)
         fitness, _, _, _, _, _, _ = evaluate(model, positions, target_flows, pressure, level, stats)
 
         for i in range(pop_size):
@@ -176,7 +200,7 @@ def optimize_strategy(model, target_flows, pressure, level,
     for key, (fit, pos) in sorted_states[:top_k]:
         states = np.array(key, dtype=np.int64)
         freqs = np.where(states > 0,
-                         FREQ_MIN + pos[N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN),
+                         np.round(FREQ_MIN + pos[N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)),
                          0.0)
         pressure_used = pressure + (pos[-1] * 2 - 1) * PRESSURE_TOL
         # v6 返回 6 个值
@@ -211,7 +235,7 @@ def optimize_strategy(model, target_flows, pressure, level,
                 continue
             pos = pbest_positions[idx]
             freqs = np.where(states > 0,
-                             FREQ_MIN + pos[N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN),
+                             np.round(FREQ_MIN + pos[N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)),
                              0.0)
             pressure_used = pressure + (pos[-1] * 2 - 1) * PRESSURE_TOL
             # v6 返回 6 个值
@@ -280,7 +304,7 @@ def print_result(result):
         print(f"\n方案{rank} [{status}] 预测效率 {cand['efficiency']:.1f}%  |  千吨水电耗 {cand['kwt']:.1f} kWh")
         print(f"  泵号:  {' '.join(f'P{i+1}' for i in range(N_PUMPS))}")
         print(f"  状态:  {' '.join('开 ' if s else '关 ' for s in cand['states'])}")
-        print(f"  频率:  {' '.join(f'{f:5.1f}' for f in cand['freqs'])} Hz")
+        print(f"  频率:  {' '.join(f'{f:5.0f}' for f in cand['freqs'])} Hz")
         print(f"  压力:  {cand['pressure']:.4f} MPa (修正后送模型)")
         print(f"  预测流量: 170:1={cand['pred_flows'][0]:.1f}  170:2={cand['pred_flows'][1]:.1f}  "
               f"70:3={cand['pred_flows'][2]:.1f} m3/h")
