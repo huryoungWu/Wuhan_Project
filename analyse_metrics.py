@@ -8,7 +8,7 @@ import re
 import statistics
 from collections import OrderedDict
 
-files = sorted(glob.glob(r"D:\Wuhan_Project\results\metrics_result_*.txt"))
+files = sorted(glob.glob(r"D:\Wuhan_Project\results_v2\metrics_result_*.txt"))
 print(f"共找到 {len(files)} 个文件\n")
 
 # indicator -> {metric -> [values]}
