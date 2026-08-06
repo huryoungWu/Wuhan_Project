@@ -1,2 +1,0 @@
-﻿TimePoint,Pressure,Target_Flow,Liquid_Level,Pump_Group,P1_Freq,P2_Freq,P3_Freq,P4_Freq,P5_Freq,P6_Freq,P7_Freq,Total_Flow,Flow_Deviation,Eff,PCTW,Confidence,Dev_Confidence,Total_Confidence,Appear_Count,Reused
-1,0.33,2700,3.3,1100101,42,50,0,0,50,0,50,2849.7,149.7,55.26,161.29,0.0,0.8,0.4,0,0
