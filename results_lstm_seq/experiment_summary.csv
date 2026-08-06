@@ -1,0 +1,2 @@
+label,resample_freq,test_days,dropout,hidden_dim,num_layers,learning_rate,teacher_forcing_ratio,lookback_days,predict_days,predict_steps,n_train_samples,n_test_samples,best_epoch,train_loss,test_loss,train_mae,test_mae,train_rmse,test_rmse,train_mape,test_mape
+L7_P24H_5min_clean_1,15min,10,0.1,64,2,0.002,0.1,1,1.0,96,2035,769,19,0.09409253151689173,0.19763639224366186,115.673645,164.79124,151.41036823604585,219.43782932188333,4.612375795841217,5.738700181245804
