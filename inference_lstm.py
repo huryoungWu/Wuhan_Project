@@ -9,7 +9,7 @@ import torch
 
 # 保证能从本目录导入训练脚本 (复用其特征工程, 推理与训练完全一致)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_lstm_clean import BASE_CONFIG, DataProcessor, Seq2SeqModel
+from train_lstm import BASE_CONFIG, DataProcessor, Seq2SeqModel
 
 DEFAULT_DATA = r'D:\Wuhan_Project\results_lstm_seq\L7_P24H_5min_clean_1\input_lookback_L7_P24H_5min_clean_1.csv'
 DEFAULT_RESULT_DIR = r"D:\Wuhan_Project\results_lstm_seq\L7_P24H_5min_clean_1"
