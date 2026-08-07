@@ -11,8 +11,20 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train_lstm import BASE_CONFIG, DataProcessor, Seq2SeqModel
 
-DEFAULT_DATA = r'D:\Wuhan_Project\results_lstm_seq\L7_P24H_5min_clean_1\input_lookback_L7_P24H_5min_clean_1.csv'
-DEFAULT_RESULT_DIR = r"D:\Wuhan_Project\results_lstm_seq\L7_P24H_5min_clean_1"
+DEFAULT_DATA = r'D:\Wuhan_Project\results_lstm_seq\L7_P24H_15min\input_lookback_L7_P24H_15min.csv'
+DEFAULT_RESULT_DIR = r"D:\Wuhan_Project\results_lstm_seq\L7_P24H_15min"
+
+# ── 分时压力默认参数 (厂方自行决定, 时段待定; 有需要可自行更改, 不改即默认) ──
+# 每项: (起始小时, 结束小时, 目标压力 MPa), 区间左闭右开 [start, end)
+DEFAULT_PRESSURE_SCHEDULE = [
+    (0, 5, 0.30),    # 0-5点   0.3
+    (5, 12, 0.33),   # 5-12点  0.33
+    (12, 16, 0.33),  # 12-16点 0.33
+    (16, 23, 0.33),  # 16-23点 0.33
+    (23, 24, 0.30),  # 23-0点  0.3
+]
+DEFAULT_PRESSURE_ERROR = 0      # 典型压力误差
+DEFAULT_PRESSURE_ERROR_MAX = 0   # 最大压力误差
 
 
 class FlowPredictor:
@@ -52,7 +64,8 @@ class FlowPredictor:
       pred_list = predictor.predict(df_raw, as_list=True)  # [{"timestamp": ..., "Total_Flow": ...}, ...]
     """
 
-    def __init__(self, result_dir=DEFAULT_RESULT_DIR, device=None):
+    def __init__(self, result_dir=DEFAULT_RESULT_DIR, device=None,
+                 pressure_schedule=None, pressure_error=None, pressure_error_max=None):
         self.result_dir = result_dir
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -93,6 +106,13 @@ class FlowPredictor:
         self.processor.feature_scaler = self.feature_scaler
         self.processor.target_scaler = self.target_scaler
         self.processor.feature_cols = self.feature_cols
+
+        # ── 分时压力参数 (默认见模块顶部, 有需要可自行更改) ──
+        self.pressure_schedule = (list(DEFAULT_PRESSURE_SCHEDULE)
+                                  if pressure_schedule is None else pressure_schedule)
+        self.pressure_error = DEFAULT_PRESSURE_ERROR if pressure_error is None else pressure_error
+        self.pressure_error_max = (DEFAULT_PRESSURE_ERROR_MAX
+                                   if pressure_error_max is None else pressure_error_max)
 
         print(f"[FlowPredictor] 模型已加载: {os.path.basename(model_path)}")
         print(f"[FlowPredictor] lookback={self.lookback_days}d ({self.lookback_steps}步), "
@@ -183,6 +203,76 @@ class FlowPredictor:
             {"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"), "Total_Flow": float(v)}
             for ts, v in result["Total_Flow"].items()
         ]
+
+    @staticmethod
+    def _pressure_target(ts, schedule):
+        """按小时查找时刻 ts 对应的分时压力目标值 (时段表左闭右开)。"""
+        hour = ts.hour
+        for start, end, target in schedule:
+            if start <= hour < end:
+                return target
+        raise ValueError(
+            f"时刻 {ts} (小时 {hour}) 不在分时压力时段内, "
+            f"请检查 pressure_schedule: {schedule}")
+
+    def predict_pressure(self, pred, pressure_schedule=None, pressure_error=None,
+                         pressure_error_max=None, as_list=False):
+        """基于 predict() 的结果生成分时压力预测, 返回新变量 (不覆盖原 pred)。
+
+        默认分时压力时段 (厂方待定, 可自行更改):
+            0-5点 0.3 | 5-12点 0.33 | 12-16点 0.33 | 16-23点 0.33 | 23-0点 0.3
+        默认压力误差: 典型 0.02, 最大 0.03 (误差幅值在 [0.02, 0.03] 内随机取值,
+        方向随机; 传 pressure_error=0 可使误差在 [0, 0.03] 内取值)。
+
+        Parameters
+        ----------
+        pred : pd.DataFrame | list[dict]
+            predict() 的输出 (DataFrame: DatetimeIndex + Total_Flow;
+            list[dict]: timestamp + Total_Flow)。
+        pressure_schedule : list[(int, int, float)] | None
+            分时压力时段表 [(起始小时, 结束小时, 目标压力), ...], 默认模块级
+            DEFAULT_PRESSURE_SCHEDULE。
+        pressure_error / pressure_error_max : float | None
+            典型 / 最大压力误差幅值, 默认 DEFAULT_PRESSURE_ERROR / _MAX。
+        as_list : bool
+            与 predict() 一致: True 返回 list[dict], False 返回 DataFrame。
+
+        Returns
+        -------
+        pd.DataFrame | list[dict]
+            新变量 (不改动传入的 pred): 按时间顺序排列, 与 pred 时刻一一对应,
+            在原有 Total_Flow 基础上新增 Pressure 列/键。
+        """
+        schedule = self.pressure_schedule if pressure_schedule is None else pressure_schedule
+        err = self.pressure_error if pressure_error is None else pressure_error
+        err_max = self.pressure_error_max if pressure_error_max is None else pressure_error_max
+        if err > err_max:
+            raise ValueError(f"pressure_error ({err}) 不应大于 pressure_error_max ({err_max})")
+
+        # 统一为按时间排序的 DataFrame (copy, 不修改传入的 pred)
+        if isinstance(pred, pd.DataFrame):
+            result = pred.copy()
+        else:
+            result = pd.DataFrame(list(pred))
+            result["timestamp"] = pd.to_datetime(result["timestamp"])
+            result = result.set_index("timestamp")
+        result = result.sort_index()
+
+        pressures = []
+        for ts in result.index:
+            target = self._pressure_target(ts, schedule)
+            err_mag = np.random.uniform(err, err_max)          # 误差幅值 [典型, 最大]
+            pressures.append(round(target + (err_mag if np.random.rand() < 0.5 else -err_mag), 3))
+        result["Pressure"] = pressures
+
+        if as_list:
+            return [
+                {"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                 "Total_Flow": float(row["Total_Flow"]),
+                 "Pressure": float(row["Pressure"])}
+                for ts, row in result.iterrows()
+            ]
+        return result
 
     def _predict_from_csv(self, csv_path, encoding="utf-8-sig"):
         """模式2: 以 CSV 文件路径给出输入, 读取后交给 _predict_df 执行。"""
@@ -297,11 +387,17 @@ def main():
     predictor = FlowPredictor(args.result_dir)
     pred = predictor.predict(args.data,as_list=True)   # 统一接口: 自动识别 CSV 路径
     print(f'pred:{pred}')
-    pred.to_csv(args.out, index=True, encoding="utf-8-sig")
 
-    print(f"\n预测结果已保存: {args.out}")
-    print(pred.head(10))
-    print(f"... (共 {len(pred)} 行, {pred.index[0]} ~ {pred.index[-1]})")
+    # 新增: 基于 pred 按分时压力时段生成压力预测 → 新变量 pred_pressure,
+    # 不覆盖原 pred (默认时段/误差见模块顶部, 有需要可自行更改)
+    pred_pressure = predictor.predict_pressure(pred, as_list=True)
+    print(f'pred_pressure:{pred_pressure}')
+
+    # pred.to_csv(args.out, index=True, encoding="utf-8-sig")
+
+    # print(f"\n预测结果已保存: {args.out}")
+    # print(pred.head(10))
+    # print(f"... (共 {len(pred)} 行, {pred.index[0]} ~ {pred.index[-1]})")
 
 
 if __name__ == "__main__":

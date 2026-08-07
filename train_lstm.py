@@ -55,7 +55,7 @@ BASE_CONFIG = {
 
     "lookback_days": 1,                      # 回看窗口 (天)
     "predict_days": 1.0,                     # 预测窗口 (天)
-    "label": "L7_P24H_5min_clean_1",         # 结果子目录名
+    "label": "L7_P24H_15min",         # 结果子目录名
 
     "test_days": 10,  # 测试集取最后 N 天: 必须 ≥ 回看+预测天数, 否则测试序列数为 0
 

@@ -11,7 +11,8 @@
 寻优 (粒子群优化):
   - 约束: 模型预测流量与目标流量偏差 ≤ ±100 m³/h
   - 目标: 满足约束的前提下, 预测总管效率最大化
-  - 频率: 强制整数 Hz (30~50, 共21档), 与现场变频器整数设定一致
+  - 频率: 强制整数 Hz (30~50, 共21档), 与现场变频器整数设定一致;
+         第7号泵 (P7) 固定只有 0 / 50 Hz 两个状态 (现场定频工况)
 
 用法 (接口调用):
   from pump_inference import PumpInference
@@ -64,16 +65,32 @@ PSO_SEED = 42                # 随机种子
 #   吸附到整数档位中心, 保证 pbest/gbest 吸引点与评估点一致 (见下)
 # ============================================================================
 
+def decode_freqs(states, freq_genes):
+    """频率解码: 运行泵取整数 Hz 档 (30~50, 共21档); 泵关闭 → 0。
+
+    第7号泵 (P7) 固定只有 0 / 50 Hz 两个状态: 开启即固定 50 Hz。
+    states / freq_genes: (7,) 或 (n,7)。
+    """
+    one_d = states.ndim == 1
+    if one_d:
+        states = states[None, :]
+        freq_genes = freq_genes[None, :]
+    freqs = np.where(states > 0,
+                     np.round(FREQ_MIN + freq_genes * (FREQ_MAX - FREQ_MIN)),
+                     0.0)
+    freqs[:, 6] = np.where(states[:, 6] > 0, 50.0, 0.0)   # P7: 只有 0 / 50 Hz
+    return freqs[0] if one_d else freqs
+
+
 def decode(genes, pressure_target):
     """基因 → (泵状态, 频率, 压力). genes: (n, 15)
 
     频率取整到整数 Hz: freq = round(FREQ_MIN + gene × (FREQ_MAX−FREQ_MIN)),
     即 30~50 Hz 共 21 档, 与现场变频器整数设定一致; 泵关闭 → 0。
+    第7号泵 (P7) 只有 0 / 50 Hz 两档: 开启即固定 50 Hz。
     """
     states = (genes[:, :N_PUMPS] > 0.5).astype(np.int64)
-    freqs = np.where(states > 0,
-                     np.round(FREQ_MIN + genes[:, N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)),
-                     0.0)
+    freqs = decode_freqs(states, genes[:, N_PUMPS:2 * N_PUMPS])
     pressure = pressure_target + (genes[:, -1] * 2 - 1) * PRESSURE_TOL
     return states, freqs, pressure
 
@@ -90,6 +107,8 @@ def snap_freq_genes(genes):
     freqs = FREQ_MIN + g[:, N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)
     freqs_int = np.round(freqs)
     g[:, N_PUMPS:2 * N_PUMPS] = (freqs_int - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)
+    # P7 频率固定 50 Hz → 频率基因吸附到 1.0 (50 Hz 档位中心), 与评估点一致
+    g[:, 2 * N_PUMPS - 1] = 1.0
     return g
 
 
@@ -199,9 +218,7 @@ def optimize_strategy(model, target_flows, pressure, level,
     # 取前 top_k 个不同状态（已经去重）
     for key, (fit, pos) in sorted_states[:top_k]:
         states = np.array(key, dtype=np.int64)
-        freqs = np.where(states > 0,
-                         np.round(FREQ_MIN + pos[N_PUMPS:2 * N_PUMPS] * (FREQ_MAX - FREQ_MIN)),
-                         0.0)
+        freqs = decode_freqs(states, pos[N_PUMPS:2 * N_PUMPS])
         pressure_used = pressure + (pos[-1] * 2 - 1) * PRESSURE_TOL
         # v6 返回 6 个值
         t0 = time.perf_counter()
