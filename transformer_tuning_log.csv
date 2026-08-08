@@ -1,0 +1,2 @@
+﻿exp_id,label,overrides,timestamp,status,n_epochs,best_epoch,runtime_min,train_loss,train_mae,train_rmse,train_mape,test_loss,test_mae,test_rmse,test_mape
+BASE,L7_P24H_15min_transformer,{},2026-08-08 00:00:00,OK,36,6,,0.033539,71.28,90.4,2.81,0.160291,156.45,197.62,5.5

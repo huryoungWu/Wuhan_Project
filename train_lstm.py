@@ -55,15 +55,21 @@ BASE_CONFIG = {
 
     "lookback_days": 1,                      # 回看窗口 (天)
     "predict_days": 1.0,                     # 预测窗口 (天)
-    "label": "L7_P24H_15min",         # 结果子目录名
+    "label": "L7_P24H_15min_dropout0.2_numlayers3",         # 结果子目录名
 
     "test_days": 10,  # 测试集取最后 N 天: 必须 ≥ 回看+预测天数, 否则测试序列数为 0
 
+    "mape_floor_ratio": 0.05,  # MAPE 过滤: 排除 |true| < 该比例 * max|true| 的点 (夜间近零流量)
+
     "hidden_dim": 64,
     "num_layers": 2,
-    "dropout": 0.1,
+    "dropout": 0.2,
 
-    "teacher_forcing_ratio": 0.1,
+    # teacher forcing 退火: 从 start 线性衰减到 end, 经 anneal_epochs 轮
+    # (前期喂真实值加速收敛, 后期纯自回归消除训练/推理分布差)
+    "teacher_forcing_start": 0.5,
+    "teacher_forcing_end": 0.0,
+    "teacher_forcing_anneal_epochs": 100,
 
     "batch_size": 32,
     "epochs": 500,
@@ -579,6 +585,26 @@ def weighted_mse_loss(pred, target, flow_weight=1.0):
     return flow_weight * flow_loss
 
 
+def compute_mape(y_true, y_pred, floor_ratio=0.05):
+    """MAPE (%), 排除 |true| < floor_ratio * max|true| 的点。
+
+    夜间近零流量 (几 m³/h) 使分母趋近 0, 相对误差虚高并主导整体 MAPE;
+    按最大流量的比例设下限, 只统计有意义的点。返回 (mape, n_total, n_used)。
+    """
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    n_total = len(y_true)
+    if n_total == 0:
+        return 0.0, 0, 0
+    thr = floor_ratio * np.abs(y_true).max()
+    mask = np.abs(y_true) >= thr
+    n_used = int(mask.sum())
+    if n_used == 0:
+        return 0.0, n_total, 0
+    mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / (y_true[mask] + 1e-8))) * 100
+    return mape, n_total, n_used
+
+
 def evaluate(model, loader, device, processor):
     model.eval()
     total_loss = 0.0
@@ -608,11 +634,14 @@ def evaluate(model, loader, device, processor):
     y_pred_flat = y_pred_inv[:, :, 0].reshape(-1)
     flow_mae = mean_absolute_error(y_true_flat, y_pred_flat)
     flow_rmse = math.sqrt(mean_squared_error(y_true_flat, y_pred_flat))
-    flow_mape = np.mean(np.abs((y_true_flat - y_pred_flat) / (y_true_flat + 1e-8))) * 100
+    # MAPE 过滤夜间近零流量点: |true| < floor_ratio * max|true| 不参与 (见 compute_mape)
+    flow_mape, mape_n_total, mape_n_used = compute_mape(
+        y_true_flat, y_pred_flat, processor.config.get("mape_floor_ratio", 0.05))
 
     return {
         "loss": avg_loss, "flow_mae": flow_mae, "flow_rmse": flow_rmse,
-        "flow_mape": flow_mape, "y_pred_inv": y_pred_inv, "y_true_inv": y_true_inv
+        "flow_mape": flow_mape, "mape_n_used": mape_n_used, "mape_n_total": mape_n_total,
+        "y_pred_inv": y_pred_inv, "y_true_inv": y_true_inv
     }
 
 
@@ -696,12 +725,63 @@ def plot_error_distribution(y_true_inv, y_pred_inv, save_path, title_prefix="Tes
     print(f"    误差分布图已保存: {save_path}")
 
 
+def stat_by_start_time(y_true_inv, y_pred_inv, start_times, save_dir, floor_ratio=0.05):
+    """按预测起点时刻 (0:00~23:30, 30 分钟间隔) 统计测试集 MAE/RMSE/MAPE。
+
+    start_times: 与 y_true_inv 样本一一对应的预测起点时间 (DatetimeIndex 子集)。
+    15min 数据的起点落在 :00/:15/:30/:45, 归入最近半小时槽。
+    MAPE 用整个测试集的全局阈值过滤近零流量点 (|true| < floor_ratio * max|true|),
+    保证各槽位过滤口径一致。
+    """
+    n = len(y_true_inv)
+    if n == 0 or start_times is None or len(start_times) != n:
+        print("    ⚠ 样本数与起点时间不匹配, 跳过按起点时刻统计")
+        return
+
+    # 起点 → 30 分钟槽 (0~47, 对应 0:00~23:30)
+    slots = np.array([t.hour * 2 + (1 if t.minute >= 30 else 0) for t in start_times])
+    y_true = y_true_inv[:, :, 0]
+    y_pred = y_pred_inv[:, :, 0]
+
+    # 全局阈值 (整个测试集), 各槽位过滤口径一致
+    thr = floor_ratio * np.abs(y_true).max()
+
+    rows = []
+    for s in range(48):
+        mask = slots == s
+        n_slot = int(mask.sum())
+        if n_slot == 0:
+            continue
+        tt = y_true[mask].reshape(-1)
+        pp = y_pred[mask].reshape(-1)
+        mae = mean_absolute_error(tt, pp)
+        rmse = math.sqrt(mean_squared_error(tt, pp))
+        m_map = np.abs(tt) >= thr
+        mape = (np.mean(np.abs((tt[m_map] - pp[m_map]) / (tt[m_map] + 1e-8))) * 100
+                if m_map.sum() > 0 else 0.0)
+        rows.append({
+            "start_time": f"{s // 2:02d}:{30 if s % 2 else 0:02d}",
+            "n_samples": n_slot, "mae": mae, "rmse": rmse, "mape": mape,
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(save_dir, "test_start_time_metrics.csv")
+    df.to_csv(csv_path, index=False, float_format="%.4f")
+    print(f"    按起点时刻精度统计已保存: {csv_path}")
+    print(f"    (MAPE 过滤阈值 {thr:.2f}, 排除 |true| < 阈值 的点)")
+    print("    起点时刻  样本数      MAE      RMSE     MAPE%")
+    for r in rows:
+        print(f"    {r['start_time']}  {r['n_samples']:<6}  "
+              f"{r['mae']:<8.2f}  {r['rmse']:<8.2f}  {r['mape']:<8.2f}")
+
+
 # ==================== 单次实验运行 ====================
 
-def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, processor, device):
+def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, processor, device, test_index=None):
     """
     按合并后的 cfg (BASE_CONFIG 被实验配置覆盖) 运行一次完整的训练+评估
     返回 metrics 字典
+    test_index: 测试段时间索引 (DatetimeIndex), 用于按预测起点时刻统计精度
     """
     processor.config = cfg   # 序列构建/时间划分按本实验参数
     lookback = cfg["lookback_days"]
@@ -716,7 +796,8 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     print(f" 实验: {label}  |  lookback={lookback}d  |  predict={predict}d"
           f"  |  freq={cfg['resample_freq']}  |  test_days={cfg['test_days']}"
           f"  |  dropout={cfg['dropout']}  |  hidden={cfg['hidden_dim']}"
-          f"  |  layers={cfg['num_layers']}  |  lr={cfg['learning_rate']}")
+          f"  |  layers={cfg['num_layers']}  |  lr={cfg['learning_rate']}"
+          f"  |  tf退火={cfg['teacher_forcing_start']}→{cfg['teacher_forcing_end']}@{cfg['teacher_forcing_anneal_epochs']}轮")
     print(f" 结果目录: {result_dir}")
     print(f"{'='*80}")
 
@@ -728,6 +809,15 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     freq_minutes = int(cfg["resample_freq"].replace("min", ""))
     points_per_day = (24 * 60) // freq_minutes
     predict_steps = int(predict * points_per_day)
+
+    # 每个测试样本的预测起点时刻 = 测试段第 lookback_steps + idx*stride 行的时间
+    # (样本 idx 的回看窗口从 idx*stride 行开始, 预测从 +lookback_steps 行开始)
+    stride = cfg.get("stride", 1)
+    lookback_steps = int(lookback * points_per_day)
+    if test_index is not None:
+        test_starts = test_index[lookback_steps:len(X_test) * stride + lookback_steps:stride]
+    else:
+        test_starts = None
 
     print(f"  {cfg['resample_freq']}频率: lookback={int(lookback * points_per_day)}步, predict={predict_steps}步")
     print(f"  X_train={X_train.shape}, Y_train={Y_train.shape}")
@@ -764,13 +854,18 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
         train_loss_sum = 0.0
+        # teacher forcing 退火: 随 epoch 从 start 线性衰减到 end
+        # (前期喂真实值加速收敛, 后期纯自回归, 消除训练/推理分布差)
+        anneal = min(epoch / cfg["teacher_forcing_anneal_epochs"], 1.0)
+        tf_ratio = (cfg["teacher_forcing_start"]
+                    - (cfg["teacher_forcing_start"] - cfg["teacher_forcing_end"]) * anneal)
 
         for batch_x, batch_y in train_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
 
             pred = model(batch_x, target_len=batch_y.size(1), tgt=batch_y,
-                         teacher_forcing_ratio=cfg["teacher_forcing_ratio"])
+                         teacher_forcing_ratio=tf_ratio)
             loss = weighted_mse_loss(pred, batch_y)
             optimizer.zero_grad()
             loss.backward()
@@ -828,11 +923,18 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
           f"RMSE={train_metrics['flow_rmse']:.2f}, MAPE={train_metrics['flow_mape']:.2f}%")
     print(f"  Test : Loss={test_metrics['loss']:.6f}, MAE={test_metrics['flow_mae']:.2f}, "
           f"RMSE={test_metrics['flow_rmse']:.2f}, MAPE={test_metrics['flow_mape']:.2f}%")
+    mape_floor = cfg.get("mape_floor_ratio", 0.05)
+    print(f"  (MAPE 已过滤 |true| < {mape_floor:.0%}*max 的近零流量点: "
+          f"Train 保留 {train_metrics['mape_n_used']}/{train_metrics['mape_n_total']}, "
+          f"Test 保留 {test_metrics['mape_n_used']}/{test_metrics['mape_n_total']})")
 
     with open(os.path.join(result_dir, "metrics.txt"), "w", encoding="utf-8") as f:
         for name, m in [("Train", train_metrics), ("Test", test_metrics)]:
             f.write(f"{name}: Loss={m['loss']:.6f}, MAE={m['flow_mae']:.2f}, "
                     f"RMSE={m['flow_rmse']:.2f}, MAPE={m['flow_mape']:.2f}%\n")
+        f.write(f"MAPE 过滤: 排除 |true| < {mape_floor:.0%} * max|true| 的点 "
+                f"(Train 保留 {train_metrics['mape_n_used']}/{train_metrics['mape_n_total']} 点, "
+                f"Test 保留 {test_metrics['mape_n_used']}/{test_metrics['mape_n_total']} 点)\n")
 
     # 画图 (仅测试集)
     y_true_test = test_metrics["y_true_inv"]
@@ -846,6 +948,10 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         mae_per_step = np.mean(np.abs(y_true_test - y_pred_test), axis=0)
         step_mae_df = pd.DataFrame({"step": np.arange(len(mae_per_step)), "flow_mae": mae_per_step[:, 0]})
         step_mae_df.to_csv(os.path.join(result_dir, "test_step_mae.csv"), index=False)
+
+        # 按预测起点时刻 (0:00~23:30) 统计测试集精度
+        stat_by_start_time(y_true_test, y_pred_test, test_starts, result_dir,
+                           floor_ratio=cfg.get("mape_floor_ratio", 0.05))
 
     # loss 曲线
     plt.figure(figsize=(10, 5))
@@ -866,7 +972,9 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         "hidden_dim": cfg["hidden_dim"],
         "num_layers": cfg["num_layers"],
         "learning_rate": cfg["learning_rate"],
-        "teacher_forcing_ratio": cfg["teacher_forcing_ratio"],
+        "teacher_forcing_start": cfg["teacher_forcing_start"],
+        "teacher_forcing_end": cfg["teacher_forcing_end"],
+        "teacher_forcing_anneal_epochs": cfg["teacher_forcing_anneal_epochs"],
         "lookback_days": lookback,
         "predict_days": predict,
         "predict_steps": predict_steps,
@@ -921,7 +1029,7 @@ def main():
     # ============ 第三步: 训练 & 评估 ============
     result = run_experiment(config, x_train_all, y_train_all,
                             x_test_all, y_test_all,
-                            processor, device)
+                            processor, device, test_index=df_test_feat.index)
     if result is not None:
         print(f"\n 训练完成! 结果保存在: {os.path.join(config['base_result_dir'], config['label'])}")
     else:

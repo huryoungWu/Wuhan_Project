@@ -1,4 +1,0 @@
-Train: Loss=0.670493, MAE=161.51, RMSE=193.92, MAPE=45.10%
-Train 目标MAE: 70:3_瞬时流量=161.51
-Test: Loss=0.924514, MAE=188.94, RMSE=227.71, MAPE=47.23%
-Test 目标MAE: 70:3_瞬时流量=188.94
