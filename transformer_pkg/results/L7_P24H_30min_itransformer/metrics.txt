@@ -1,0 +1,3 @@
+Train: Loss=0.077370, MAE=104.54, RMSE=136.90, MAPE=4.10%
+Test: Loss=0.095222, MAE=119.93, RMSE=151.88, MAPE=4.39%
+MAPE 过滤: 排除 |true| < 10% * max|true| 的点 (Train 保留 44352/44352 点, Test 保留 23088/23088 点)

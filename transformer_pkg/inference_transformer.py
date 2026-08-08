@@ -11,10 +11,13 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train_transformer import BASE_CONFIG
 from transformer_model import TimeSeriesTransformer
+from itransformer_model import iTransformer
 from data_processing import DataProcessor
 
 DEFAULT_DATA = r'D:\Wuhan_Project\input_lookback.csv'
-DEFAULT_RESULT_DIR = r"D:\Wuhan_Project\transformer_pkg\results\L7_P24H_30min_transformer"
+# 默认加载 iTransformer 模型 (2026-08-08 训练, 测试集 MAE 优于原 Transformer)
+# 模型类型由结果目录 scaler.pkl 里的 model_type 字段自动判别, 无需手动切换
+DEFAULT_RESULT_DIR = r"D:\Wuhan_Project\transformer_pkg\results\L7_P24H_30min_itransformer"
 
 # ── 分时压力默认参数 (厂方自行决定, 时段待定; 有需要可自行更改, 不改即默认) ──
 # 每项: (起始小时, 结束小时, 目标压力 MPa), 区间左闭右开 [start, end)
@@ -93,7 +96,9 @@ class FlowPredictor:
         model_path = os.path.join(result_dir, "best_seq2seq_model.pth")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"未找到模型权重: {model_path}")
-        self.model = TimeSeriesTransformer(
+        # ── 模型工厂: 按训练时保存的 model_type 构造 (旧结果无该键 → 默认 transformer) ──
+        model_type = self.config.get("model_type", "transformer")
+        common_model_kwargs = dict(
             input_dim=len(self.feature_cols),
             output_dim=1,
             horizon=self.predict_steps,
@@ -103,7 +108,14 @@ class FlowPredictor:
             num_layers=self.config["num_layers"],
             dim_feedforward=self.config["dim_feedforward"],
             dropout=self.config["transformer_dropout"],
-        ).to(self.device)
+        )
+        if model_type == "itransformer":
+            self.model = iTransformer(
+                **common_model_kwargs,
+                target_idx=self.feature_cols.index(self.target_cols[0]),
+            ).to(self.device)
+        else:
+            self.model = TimeSeriesTransformer(**common_model_kwargs).to(self.device)
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
 
@@ -120,7 +132,8 @@ class FlowPredictor:
         self.pressure_error_max = (DEFAULT_PRESSURE_ERROR_MAX
                                    if pressure_error_max is None else pressure_error_max)
 
-        print(f"[FlowPredictor] 模型已加载: {os.path.basename(model_path)}")
+        print(f"[FlowPredictor] 模型已加载: {os.path.basename(model_path)} "
+              f"(model_type={self.config.get('model_type', 'transformer')})")
         print(f"[FlowPredictor] lookback={self.lookback_days}d ({self.lookback_steps}步), "
               f"predict={self.predict_days}d ({self.predict_steps}步), freq={self.resample_freq}, "
               f"特征数={len(self.feature_cols)}, d_model={self.config['d_model']}, "
@@ -383,7 +396,7 @@ class FlowPredictor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transformer 流量预测推理 (基于 train_transformer.py 训练结果)")
+        description="Transformer 流量预测推理")
     parser.add_argument("--data", default=DEFAULT_DATA,
                         help="输入原始数据 CSV 路径 (与训练数据格式一致)")
     parser.add_argument("--result_dir", default=DEFAULT_RESULT_DIR,

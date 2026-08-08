@@ -1,4 +1,5 @@
 import os
+import argparse
 import math
 import pickle
 import random
@@ -17,8 +18,10 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # ── 共享模块 (2026-08-08 重构拆分, 与推理脚本同目录) ──
 # 模型结构 → transformer_model.py (TimeSeriesTransformer, 推理共用同一份代码)
+#          → itransformer_model.py (iTransformer, 经 --model 切换, 默认不变)
 # 数据管线 → data_processing.py   (清洗/特征/训练测试集划分, 推理共用)
 from transformer_model import TimeSeriesTransformer
+from itransformer_model import iTransformer
 from data_processing import DataProcessor, SeqDataset
 
 # ============================================================================
@@ -54,7 +57,7 @@ BASE_CONFIG = {
 
     "lookback_days": 1,                      # 回看窗口 (天)
     "predict_days": 1.0,                     # 预测窗口 (天)
-    "label": "L7_P24H_30min_transformer",         # 结果子目录名
+    "label": "L7_P24H_30min_itransformer_test",         # 结果子目录名
 
     "test_days": 12,  # 测试集取最后 N 天: 必须 ≥ 回看+预测天数, 否则测试序列数为 0
 
@@ -70,6 +73,8 @@ BASE_CONFIG = {
     "num_layers": 3,           # Encoder 层数
     "dim_feedforward": 256,    # 前馈层隐层维度
     "transformer_dropout": 0.2,
+
+    "model_type": "itransformer",  # 模型类型: transformer (默认, 原版) | itransformer
 
     # 训练超参 (Transformer 对 lr 更敏感, 降到 1e-3)
     "batch_size": 32,
@@ -340,7 +345,8 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     ensure_dir(result_dir)
 
     print(f"\n{'='*80}")
-    print(f" 实验: {label}  |  lookback={lookback}d  |  predict={predict}d"
+    print(f" 实验: {label}  |  model_type={cfg.get('model_type', 'transformer')}"
+          f"  |  lookback={lookback}d  |  predict={predict}d"
           f"  |  freq={cfg['resample_freq']}  |  test_days={cfg['test_days']}"
           f"  |  d_model={cfg['d_model']}  |  nhead={cfg['nhead']}"
           f"  |  layers={cfg['num_layers']}  |  lr={cfg['learning_rate']}")
@@ -376,7 +382,9 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     train_loader = DataLoader(SeqDataset(X_train, Y_train), batch_size=cfg["batch_size"], shuffle=True)
     test_loader = DataLoader(SeqDataset(X_test, Y_test), batch_size=cfg["batch_size"], shuffle=False)
 
-    model = TimeSeriesTransformer(
+    # ── 模型工厂: 按 cfg["model_type"] 构造 (默认 transformer, 与原版一致) ──
+    model_type = cfg.get("model_type", "transformer")
+    common_model_kwargs = dict(
         input_dim=X_train.shape[2],
         output_dim=1,
         horizon=predict_steps,
@@ -386,7 +394,19 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         num_layers=cfg["num_layers"],
         dim_feedforward=cfg["dim_feedforward"],
         dropout=cfg["transformer_dropout"],
-    ).to(device)
+    )
+    print(model_type,model_type == "itransformer")
+    if model_type == "itransformer":
+        # iTransformer 反归一化后目标通道处于 feature_scaler 域, 仅当
+        # target_transform=None (两 scaler 标定同一原始列) 时与 target_scaler 域一致
+        assert cfg.get("target_transform") is None, \
+            "iTransformer 要求 target_transform=None (RevIN 反归一化与 log1p 目标域不兼容)"
+        model = iTransformer(
+            **common_model_kwargs,
+            target_idx=processor.feature_cols.index(processor.target_cols[0]),
+        ).to(device)
+    else:
+        model = TimeSeriesTransformer(**common_model_kwargs).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"],
                                  weight_decay=cfg["weight_decay"])
@@ -536,7 +556,20 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 # ==================== 主入口 ====================
 
 def main():
-    config = BASE_CONFIG
+    parser = argparse.ArgumentParser(description="训练 Transformer / iTransformer 流量预测模型")
+    # default=None: 不传 --model/--label 时用 BASE_CONFIG 里的值 (改配置即生效),
+    # 显式传参才覆盖, 避免 argparse 默认值把 BASE_CONFIG 的修改顶掉
+    parser.add_argument("--model", choices=["transformer", "itransformer"], default=None,
+                        help="模型类型 (默认 None = 用 BASE_CONFIG['model_type'])")
+    parser.add_argument("--label", default=None,
+                        help="结果子目录名 (默认 None = 用 BASE_CONFIG['label'])")
+    args = parser.parse_args()
+
+    config = dict(BASE_CONFIG)            # 浅拷贝, 不修改全局 BASE_CONFIG (被 _rebuild_scaler 导入)
+    if args.model is not None:
+        config["model_type"] = args.model
+    if args.label is not None:
+        config["label"] = args.label
     set_seed(config["seed"])
 
     device = torch.device(config["device"])
