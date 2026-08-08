@@ -33,6 +33,14 @@ pump_brute_force.py — 基于 pump_inference.py 推理接口的暴力寻优算�
   opt.build_lookup_table(pressures, target_flows, levels, csv_path)
   # 在线查询 (时间点序列, 支持复用)
   solutions = opt.query_optimal_solutions([(0.33, 4000, 3.0), (0.33, 4050, 3.0)])
+
+统一接口 (与 pump_optimize_PSO.optimize_strategy 互换, 供 schedule_daily_transformer_pso.py --algo brute 调用):
+  opt = PumpBruteForceOptimizer(model=pump_inference_instance)   # 复用已加载的模型实例
+  result = opt.optimize_strategy(target_flows=2382.0, pressure=0.33, level=3.58, top_k=5)
+  或模块级入口 (每次调用新建实例, 缓存不跨调用):
+  from pump_brute_force import optimize_strategy
+  result = optimize_strategy(model, target_flows=2382.0, pressure=0.33, level=3.58, top_k=5)
+  返回格式与 pump_optimize_PSO.optimize_strategy 完全一致 (总流量口径偏差, 标量 deviation)。
 """
 
 import os
@@ -93,12 +101,14 @@ class PumpBruteForceOptimizer:
 
     搜索范围: 7 台泵全部处理, 无台数约束, 枚举全部合法组合 (104 种, 见模块 docstring)
     """
-    def __init__(self, model_path=None,
+    def __init__(self, model=None, model_path=None,
                  freq_min=30, freq_max=50, freq_step=1,
                  fixed_pumps=(5, 6),
                  eff_range=(30.0, 90.0),
                  chunk_size=200000):
-        self.model = PumpInference(model_path)
+        if model is None:
+            model = PumpInference(model_path)
+        self.model = model
 
         # ---- 每台泵的频率档位: 变频泵 30~50 步长1; 工频泵恒 50 ----
         self.vfd_levels = np.arange(freq_min, freq_max + 1e-9, freq_step, dtype=np.float32)
@@ -454,6 +464,86 @@ class PumpBruteForceOptimizer:
         print(f"  效率过滤: {self.eff_range[0]}% < 效率 ≤ {self.eff_range[1]}%")
         print(f"  批量推理分块: {self.chunk_size:,} 行/批")
         self.model.info()
+
+    # ====================== 统一接口 (与 pump_optimize_PSO 互换) ======================
+    def optimize_strategy(self, target_flows, pressure, level, top_k=3, tolerance=100.0):
+        """单点寻优 — 返回格式与 pump_optimize_PSO.optimize_strategy 完全一致。
+
+        总流量口径: 偏差 = |预测总管流量 − 目标总管流量| (单个标量, 不做三管比较,
+        目标流量传标量或 3 值向量均可, 内部求和)。
+
+        流程: evaluate_condition 枚举全部合法组合×频率档 (相同 (压力,液位) 结果
+        缓存复用) → 每组合取容差内效率最高行 (无解取最近流量行) → 跨组合按效率
+        降序取 top_k, 逐条重新推理以补齐三管明细 (top_k 条开销可忽略)。
+
+        返回 result 字典同 pump_optimize_PSO:
+          candidates: [{states, freqs, pressure, pred_flows, total_flow,
+                        efficiency, kwt, deviation, violation, feasible}, ...]
+          + target_flows / pressure_target / level / num_unique_states / timing
+        """
+        target_total = float(np.sum(np.asarray(target_flows, dtype=np.float64)))
+        t_start = time.perf_counter()
+
+        results = self.evaluate_condition(pressure, level)
+        best_rows = self._best_per_combo_for_flow(results, target_total, tolerance)
+        best_rows = sorted(best_rows, key=lambda r: r['efficiency'], reverse=True)
+
+        candidates = []
+        for r in best_rows[:top_k]:
+            states = np.asarray(r['states'], dtype=np.int64)
+            freqs = np.asarray(r['freqs'], dtype=np.float32)
+            # 批量评估只有总管流量, 逐条重新推理取得三管明细 (top_k 条开销可忽略)
+            f1, f2, f3, total_flow, eff, kwt = self.model.predict(
+                states, freqs, pressure, level)
+            dev = float(total_flow - target_total)
+            candidates.append({
+                'states': states,
+                'freqs': freqs,
+                'pressure': float(pressure),
+                'pred_flows': np.array([f1, f2, f3], dtype=np.float64),
+                'total_flow': float(total_flow),
+                'efficiency': float(eff),
+                'kwt': float(kwt),
+                'deviation': abs(dev),                          # 总流量偏差 (标量)
+                'violation': float(np.maximum(abs(dev) - tolerance, 0.0)),
+                'feasible': abs(dev) <= tolerance,
+            })
+
+        if len(candidates) == 0:   # 兜底: 无任何有效解 → 零方案
+            candidates.append({
+                'states': np.zeros(7, dtype=np.int64),
+                'freqs': np.zeros(7, dtype=np.float32),
+                'pressure': float(pressure),
+                'pred_flows': np.zeros(3, dtype=np.float64),
+                'total_flow': 0.0, 'efficiency': 0.0, 'kwt': 0.0,
+                'deviation': target_total,
+                'violation': target_total,
+                'feasible': False,
+            })
+
+        best = candidates[0]
+        best.update({
+            'target_flows': np.asarray(target_flows, dtype=np.float64),
+            'pressure_target': float(pressure),
+            'level': float(level),
+            'candidates': candidates,
+            'num_unique_states': len(candidates),
+            'timing': {'total_s': time.perf_counter() - t_start,
+                       'n_conditions_cached': len(self._eval_cache)},
+        })
+        return best
+
+
+def optimize_strategy(model, target_flows, pressure, level, top_k=3, tolerance=100.0, **kwargs):
+    """模块级入口 — 签名与 pump_optimize_PSO.optimize_strategy 一致 (可直接互换)。
+
+    注意: 每次调用新建实例, (压力, 液位) 枚举推理结果不跨调用缓存;
+    逐点批量使用时建议复用 PumpBruteForceOptimizer 实例
+    (schedule_daily_transformer_pso.py --algo brute 模式即复用实例)。
+    """
+    opt = PumpBruteForceOptimizer(model=model)
+    return opt.optimize_strategy(target_flows=target_flows, pressure=pressure,
+                                 level=level, top_k=top_k, tolerance=tolerance)
 
 
 # ====================== 演示 ======================

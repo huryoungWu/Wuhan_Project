@@ -70,36 +70,65 @@
 ```
 D:\Wuhan_Project\
 ├── README.md                              # 本文件：项目说明 + 指标结果 + 清洗逻辑 + 设计说明
-├── README_数据清洗与效率预测.md            # 数据清洗与效率预测设计说明（详细版）
-├── train.py                               # 训练脚本（v6 纯流量+效率版）
-├── train_fast.py                          # 训练快速变体（相同口径）
+│
+│  ── 水泵代理模型（原始版脚本；重构后的包见下方 pump_model/）──
+├── train.py                               # 水泵模型训练脚本（v6 纯流量+效率版：清洗→功率效率→按泵组划分→训练）
 ├── train_freq_split.py                    # 按「泵组组合×频率组合」划分的训练变体
-├── pump_inference.py                      # 推理脚本（加载权重，在线预测）
-├── pump_optimize_PSO.py                   # PSO 粒子群寻优（基于 PumpInference）
-├── pump_brute_force.py                    # 暴力枚举寻优（104 种合法泵组，基于 PumpInference）
-├── optimizer.py                           # 旧版暴力寻优（基于 predict_3_period）
-├── pump_optimizer.py                      # 寻优工具
-├── recompute_power_efficiency.py          # 独立重算功率/效率（修正电度差分方法）
-├── analyse_metrics.py                     # 解析 results/metrics_result_*.txt → 统计表 + 分布直方图
-├── plot_efficiency_histogram.py           # 总管效率分布直方图
-├── plot_pump_power_freq.py                # 各泵 频率-功率 密度散点图 + 幂律拟合
-├── pump_freq_hist.py                      # 7 台泵运行频率分布直方图
-├── pump_temp_hist.py                      # 泵温度分布直方图
+├── pump_inference.py                      # 泵站代理模型推理（PumpInference，加载 models/model_v2_combo_split.pt）
+├── pump_optimize_PSO.py                   # PSO 粒子群寻优（目标流量→最优泵组合/频率；总流量口径偏差，偏差=标量）
+├── pump_brute_force.py                    # 暴力枚举寻优（104 种合法泵组；含与 PSO 同构的 optimize_strategy 接口）
+├── optimizer.py                           # 旧版暴力寻优（基于 predict_3_period 接口）
+│
+│  ── Transformer / LSTM 流量预测（30min / 15min 级）──
+├── train_transformer.py                   # Transformer 流量预测训练脚本（原始版）
+├── inference_transformer.py               # Transformer 流量预测推理（原始版；重构版见 transformer_pkg/）
+├── inference_lstm.py                      # LSTM 流量预测推理（原始版）
+├── input_lookback.csv                     # 推理输入示例（原始数据片段）
+├── prediction.csv                         # 推理输出示例（预测流量 CSV）
+├── transformer_tuning_log.csv             # Transformer 调参实验记录
+│
+│  ── 每日泵开泵策略调度（预测 + 寻优 + DP 全局选择）──
+├── schedule_daily_transformer_pso.py      # 每日策略：Transformer 预测 → 逐点寻优（--algo pso/brute，默认 pso）→ DP 选路
+├── schedule_daily_lstm_pso.py             # 每日策略：LSTM 版（15min 级）
+├── daily_pump_schedule.csv                # 逐点策略输出（DP 选中方案）
+├── daily_pump_schedule_candidates.csv     # 每点全部候选策略
+├── daily_pump_schedule_blocks.csv         # 连续时段合并块
+├── verify_pso.py                          # PSO 寻优结果与实测/代理模型对比验证
+├── verify_pso_results.csv / verify_pso_delta.png   # verify_pso.py 输出
+│
+│  ── 工具 ──
+├── analyse_metrics.py                     # 解析结果指标 → 统计表 + 分布直方图
 ├── run.bat                                # 连续多次运行 train.py
+│
 ├── models/
-│   └── model_v2_combo_split.pt            # 训练好的模型权重（含 scaler / 压力修正 / 额定参数元数据）
+│   └── model_v2_combo_split.pt            # 泵站代理模型权重（含 scaler / 压力修正 / 额定参数元数据）
 ├── new_data/                              # 原始数据与中间结果（不纳入版本控制，可重新生成）
 │   ├── merged_minute_all.csv              # 秒级原始合并数据（约 3.8 GB，文件名沿袭旧版命名）
 │   ├── merged_minute_all_with_efficiency.csv  # 训练时生成的带效率标签中间文件（约 4.7 GB）
-│   ├── processed_cache.parquet            # 预处理缓存（约 305 MB，带口径版本标记）
+│   ├── processed_cache.parquet            # 预处理缓存（带口径版本标记，如 power_clean_v1）
+│   ├── processed_cache_old.parquet        # 旧口径缓存备份
 │   └── debug.log
-├── results/                               # 训练输出
-│   ├── metrics_result_YYYYMMDD_HHMMSS.txt # 每次训练的评估指标（含训练/测试泵组组合列表）
-│   └── metrics_distribution_histograms.png # 指标分布直方图（analyse_metrics.py 生成）
-├── new_results/                           # 频率泛化实验（train_freq_split.py）：summary.csv 汇总 + 每组合 detail_*.csv / metrics_*.json
-├── output/                                # 寻优结果（pump_brute_force_query_*.csv / *_table_*.csv）
-├── metrics_statistics_per_indicator.csv   # 42 次训练的指标统计（每指标 MAE/RMSE/MAPE 分布）
-└── metrics_statistics.csv                 # 指标统计（旧版口径）
+├── results/                               # 训练/验证输出
+│   ├── metrics_distribution_histograms.png # 指标分布直方图（analyse_metrics.py 生成）
+│   ├── 总流量_全部日期对比.png
+│   └── 每日总流量曲线/                    # 每日流量曲线图
+├── output/                                # 寻优结果输出目录（当前为空）
+├── transformer_pkg/                       # Transformer 流量预测包（2026-08-08 重构；训练/推理共用模型与数据管线）
+│   ├── __init__.py
+│   ├── transformer_model.py               # 模型结构（TimeSeriesTransformer，训练/推理共用同一份定义）
+│   ├── data_processing.py                 # 数据清洗/特征工程/训练测试集划分（训练/推理共用）
+│   ├── train_transformer.py               # 训练脚本（结果保存到本目录 results/）
+│   ├── inference_transformer.py           # 推理脚本（FlowPredictor）
+│   └── results/
+│       └── L7_P24H_30min_transformer/     # Transformer 训练产物（best_seq2seq_model.pth + scaler.pkl 等）
+└── pump_model/                            # 水泵预测模型包（2026-08-08 重构；训练/推理共用模型结构）
+    ├── __init__.py
+    ├── model.py                           # 模型结构（DeepWaterPlantModelWithEmbedding + PINN 物理约束，训练/推理共用）
+    ├── data_processing.py                 # 数据清洗/功率效率/训练测试集划分
+    ├── train.py                           # 训练脚本（权重保存到本目录 models/）
+    ├── pump_inference.py                  # 推理脚本（PumpInference）
+    └── models/
+        └── model_v2_combo_split.pt        # 泵站代理模型权重
 ```
 
 ---

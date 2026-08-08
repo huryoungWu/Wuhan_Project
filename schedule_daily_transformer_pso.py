@@ -6,18 +6,17 @@
 
   ① Transformer 流量预测 (inference_transformer.FlowPredictor)
        → 未来 48 个时间点 (30min × 24h) 的 总管流量 Total_Flow + 分时压力 Pressure
-  ② 三管分流: Transformer 只预测总管流量, 170:1/170:2/70:3 的比例按最近
-       ratio_lookback_days 天历史数据的"同一时段(30min槽位)"均值估计
-       (70:3 深夜常为 0, 按时段比例比全天平均更贴近真实)
-  ③ 逐点 PSO 寻优 (pump_optimize_PSO.optimize_strategy)
-       → 每个时间点输出多条候选策略 (默认 top 5, 不同泵状态组合)
-  ④ 全局策略选择 (动态规划): 对 48 个时间点的候选做全局路径寻优,
+  ② 逐点寻优 (默认 pso 粒子群, --algo brute 可选暴力枚举)
+       → 每个时间点输出多条候选策略 (默认 top 5, 不同泵状态组合);
+         目标 = 预测总管流量 (不再做三管分流), 偏差 = |预测总管流量 − 目标总管流量|
+         (pso → pump_optimize_PSO.optimize_strategy; brute → pump_brute_force)
+  ③ 全局策略选择 (动态规划): 对 48 个时间点的候选做全局路径寻优,
        代价 = −效率×w_eff + 流量超差×w_viol + 泵状态翻转×w_state
               + 频率变化×w_freq, 选出每个时间点最终采用哪条候选
        (泵状态切换最少 / 频率切换最少 / 效率最高, 权重越大优先级越高)
 
 每点寻优输入 (目标工况):
-  - 目标流量: 170:1 / 170:2 / 70:3 (m3/h) = 预测总管流量 × 该时段分流比例
+  - 目标流量: 预测总管流量 Total_Flow (m3/h), 三管目标不再拆分
   - 总管压力: 分时压力时段表的目标压力值 (predict_pressure 生成)
   - 液位:     默认 3.58 m (泵站基准液位, --level 可改)。液位取基准时压力
               修正量 = 0, 即给定压力直接按"修正后压力"送入寻优模型
@@ -52,12 +51,18 @@ import time
 import numpy as np
 import pandas as pd
 
-# 保证能从本目录导入两个待融合模块
+# 保证能从本目录导入待融合模块 (pump_optimize_PSO / pump_inference 在本目录)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from inference_transformer import FlowPredictor, DEFAULT_DATA, DEFAULT_RESULT_DIR
-from pump_optimize_PSO import optimize_strategy
-from pump_inference import PumpInference
+# ── Transformer 流量预测推理: 2026-08-08 起从 transformer_pkg 包引入 ──
+#    (原根目录版保留在下方注释中, 不删除)
+# from inference_transformer import FlowPredictor, DEFAULT_DATA, DEFAULT_RESULT_DIR
+from transformer_pkg.inference_transformer import FlowPredictor, DEFAULT_DATA, DEFAULT_RESULT_DIR
+
+# ── 泵站推理: 2026-08-08 起从 pump_model 包引入 ──
+#    (原根目录版保留在下方注释中, 不删除)
+# from pump_inference import PumpInference
+from pump_model.pump_inference import PumpInference
 
 # ============================================================================
 # 默认参数
@@ -65,89 +70,12 @@ from pump_inference import PumpInference
 DEFAULT_PUMP_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "models", "model_v2_combo_split.pt")
 LEVEL_DEFAULT = 3.58      # 泵站基准液位 (m): 液位缺失 → 压力修正量=0, 压力按修正后压力处理
-FLOW_COLS = ["170:1_瞬时流量", "170:2_瞬时流量", "70:3_瞬时流量"]
 FREQ_MINUTES = 30         # 与 Transformer 训练一致的重采样频率
-POINTS_PER_DAY = (24 * 60) // FREQ_MINUTES   # 48
-
-
-# ============================================================================
-# ① 三管分流比例估计 (按 30min 时段槽位)
-# ============================================================================
-
-def compute_flow_ratios(df_raw, lookback_days, freq_minutes=FREQ_MINUTES):
-    """由历史原始数据估计 170:1/170:2/70:3 三管分流比例。
-
-    每根管独立做 freq_minutes 均值重采样, 取最近 lookback_days 天; 按天内的
-    时段槽位 (0..points_per_day-1) 分组求多天均值, 得到每个槽位的三管比例。
-    槽位缺失或总量为 0 时退回全天平均比例; 全天也为 0 时退回均分。
-
-    返回 (global_ratio, slot_ratios):
-      global_ratio : (3,) 全天平均比例
-      slot_ratios  : (points_per_day, 3) 各时段槽位的比例 (行 i = 槽位 i)
-    """
-    df = df_raw.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        for ts_col in ("F_DateTime", "时间", "timestamp"):
-            if ts_col in df.columns:
-                df[ts_col] = pd.to_datetime(df[ts_col])
-                df = df.set_index(ts_col)
-                break
-        else:
-            raise ValueError("输入数据必须包含时间列 (F_DateTime / 时间 / timestamp) "
-                             "或 DatetimeIndex 索引")
-    df = df.sort_index()
-
-    missing = [c for c in FLOW_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"缺少流量列: {missing}, 需要 {FLOW_COLS}")
-
-    points_per_day = (24 * 60) // freq_minutes
-    flows = df[FLOW_COLS].resample(f"{freq_minutes}min").mean()
-    tail = flows.iloc[-lookback_days * points_per_day:]
-    if len(tail) == 0:
-        raise ValueError(f"历史数据不足: 需要 ≥ {lookback_days} 天 "
-                         f"({lookback_days * points_per_day} 个 {freq_minutes}min 点)")
-
-    # 全天平均比例 (兜底)
-    global_ratio = tail.mean().values
-    gs = global_ratio.sum()
-    if gs <= 0:
-        global_ratio = np.ones(3) / 3.0
-    else:
-        global_ratio /= gs
-
-    # 按天内的时段槽位求多天均值 → 每个槽位的比例
-    slot = (tail.index.hour * 60 + tail.index.minute) // freq_minutes
-    slot_means = tail.groupby(slot).mean()
-    slot_ratios = np.zeros((points_per_day, 3))
-    for s in range(points_per_day):
-        if s in slot_means.index:
-            r = slot_means.loc[s].values
-            rs = r.sum()
-            slot_ratios[s] = r / rs if rs > 0 else global_ratio
-        else:
-            slot_ratios[s] = global_ratio
-    return global_ratio, slot_ratios
-
-
-def split_total_flow(totals, slot_ratios, slot_indices):
-    """把总管流量按槽位比例拆成三管目标流量 (m3/h): (n,) × (n,3) → (n,3)"""
-    totals = np.asarray(totals, dtype=np.float64)
-    ratios = slot_ratios[np.asarray(slot_indices)]
-    return totals[:, None] * ratios
 
 
 # ============================================================================
 # ② 逐点寻优 + 结果整理
 # ============================================================================
-
-def optimize_point(pump_model, target_flows, pressure, level,
-                   pop_size, n_generations, top_k, seed=42):
-    """单时间点 PSO 寻优, 返回最优候选字典 (口径同 pump_optimize_PSO)。"""
-    return optimize_strategy(pump_model, target_flows=target_flows, pressure=pressure,
-                             level=level, pop_size=pop_size, n_generations=n_generations,
-                             seed=seed, top_k=top_k)
-
 
 def _close_block(blocks, start_ts, end_ts, n_points, states_str, freqs_str,
                  effs, kwts, feas, flows, pressures):
@@ -247,19 +175,19 @@ def main():
     parser.add_argument("--level", type=float, default=LEVEL_DEFAULT,
                         help=f"吸水井液位 (m); 默认 {LEVEL_DEFAULT} = 基准液位, "
                              f"压力修正量=0 → 压力直接按修正后压力处理")
-    parser.add_argument("--ratio_lookback_days", type=int, default=7,
-                        help="三管分流比例估计用的历史天数 (默认 7)")
-    parser.add_argument("--pop", type=int, default=None, help="PSO 种群规模 (默认 50)")
-    parser.add_argument("--gen", type=int, default=None, help="PSO 迭代代数 (默认 200)")
+    parser.add_argument("--pop", type=int, default=None, help="PSO 种群规模 (仅 --algo pso, 默认 50)")
+    parser.add_argument("--gen", type=int, default=None, help="PSO 迭代代数 (仅 --algo pso, 默认 200)")
     parser.add_argument("--top_k", type=int, default=5,
-                        help="每点 PSO 返回的候选策略数 (不同泵状态组合, 默认 5)")
+                        help="每点返回的候选策略数 (不同泵状态组合, 默认 5)")
+    parser.add_argument("--algo", choices=["pso", "brute"], default="pso",
+                        help="寻优算法: pso=粒子群 (默认), brute=暴力枚举 (PumpBruteForceOptimizer)")
     parser.add_argument("--w_state", type=float, default=1.0,
                         help="DP: 泵状态翻转代价 (每台泵, 默认 1.0)")
     parser.add_argument("--w_freq", type=float, default=0.01,
                         help="DP: 频率变化代价 (每 Hz, 仅统计连续运行的泵, 默认 0.01; "
                              "1 台泵满档变频 50Hz=0.5, 低于 1 次状态翻转)")
     parser.add_argument("--w_eff", type=float, default=1.0,
-                        help="DP: 效率权重 (每 % 效率, 默认 1.0)")
+                        help="DP: 效率权重 (每 %% 效率, 默认 1.0)")
     parser.add_argument("--w_viol", type=float, default=1.0,
                         help="DP: 流量超差惩罚 (每 m3/h 超出容差, 默认 1.0)")
     parser.add_argument("--fast", action="store_true",
@@ -283,26 +211,34 @@ def main():
     pred = predictor.predict_pressure(pred)      # + Pressure 列 (分时压力目标)
     print(f"   预测点数: {len(pred)}  ({pred.index[0]} ~ {pred.index[-1]})")
 
-    # ── ② 三管分流比例 ──
+    # ── ② 泵站代理模型 ──
     print("\n" + "=" * 72)
-    print(f"② 三管分流比例估计 (最近 {args.ratio_lookback_days} 天, 按 {FREQ_MINUTES}min 时段)")
-    print("=" * 72)
-    raw = pd.read_csv(args.data, encoding="utf-8-sig")
-    global_ratio, slot_ratios = compute_flow_ratios(raw, args.ratio_lookback_days)
-    print(f"   全天平均比例: 170:1={global_ratio[0]:.3f}  "
-          f"170:2={global_ratio[1]:.3f}  70:3={global_ratio[2]:.3f}")
-
-    # ── ③ 泵站代理模型 ──
-    print("\n" + "=" * 72)
-    print("③ 泵站代理模型 (PumpInference)")
+    print("② 泵站代理模型 (PumpInference)")
     print("=" * 72)
     pump_model = PumpInference(args.pump_model)
     pump_model.info()
 
-    # ── ④ 逐点 PSO 寻优 (每点输出 top_k 条候选) ──
+    # ── ③ 逐点寻优 (算法: --algo pso 默认 / brute 暴力枚举) ──
     print("\n" + "=" * 72)
-    print(f"④ 逐点 PSO 寻优 (pop={args.pop}, gen={args.gen}, top_k={args.top_k}, "
-          f"液位={args.level:.2f} m)")
+    if args.algo == "brute":
+        # 暴力枚举: 复用同一个 PumpBruteForceOptimizer 实例, (压力,液位) 枚举结果跨点缓存
+        from pump_brute_force import PumpBruteForceOptimizer
+        brute_opt = PumpBruteForceOptimizer(model=pump_model)
+        print(f"③ 逐点寻优 (算法=brute 暴力枚举, top_k={args.top_k}, 液位={args.level:.2f} m)")
+
+        def run_point(target_flows, pressure, level):
+            return brute_opt.optimize_strategy(target_flows=target_flows,
+                                               pressure=pressure, level=level,
+                                               top_k=args.top_k)
+    else:
+        from pump_optimize_PSO import optimize_strategy as _pso
+        print(f"③ 逐点寻优 (算法=pso 粒子群, pop={args.pop}, gen={args.gen}, "
+              f"top_k={args.top_k}, 液位={args.level:.2f} m)")
+
+        def run_point(target_flows, pressure, level):
+            return _pso(pump_model, target_flows=target_flows, pressure=pressure,
+                        level=level, pop_size=args.pop, n_generations=args.gen,
+                        top_k=args.top_k)
     print("=" * 72)
     n_points = len(pred)
     cands_per_point = []        # 每点: [{states, freqs, efficiency, kwt, feasible, violation, ...}, ...]
@@ -310,12 +246,9 @@ def main():
     for i, (ts, r) in enumerate(pred.iterrows()):
         total_flow = float(r["Total_Flow"])
         pressure = float(r["Pressure"])
-        slot = i % POINTS_PER_DAY
-        target_flows = total_flow * slot_ratios[slot]          # (3,) 三管目标流量
+        target_flows = total_flow                                 # 目标 = 预测总管流量 (不拆三管)
 
-        result = optimize_point(pump_model, target_flows=target_flows, pressure=pressure,
-                                level=args.level, pop_size=args.pop,
-                                n_generations=args.gen, top_k=args.top_k)
+        result = run_point(target_flows, pressure, args.level)
         cands = result["candidates"] if result.get("candidates") else [result]
         cands_per_point.append(cands)
 
@@ -327,15 +260,15 @@ def main():
         eta = elapsed / (i + 1) * (n_points - i - 1)
         flag = "OK" if best["feasible"] else "XX"   # GBK 控制台不可用 ✓/✗, 用 ASCII
         print(f"[{i+1:3d}/{n_points}] {ts.strftime('%H:%M')}  "
-              f"目标 {target_flows[0]:6.0f}/{target_flows[1]:6.0f}/{target_flows[2]:6.0f}  "
+              f"目标 {target_flows:7.0f}  "
               f"状态 {states_str}  频率 {freqs_str}  "
               f"效率 {best['efficiency']:.1f}%  千吨电耗 {best['kwt']:.1f} {flag}  "
               f"候选 {len(cands)} 条  (累计 {elapsed:.0f}s, ETA {eta:.0f}s)")
         sys.stdout.flush()
 
-    # ── ⑤ DP 全局选择 ──
+    # ── ④ DP 全局选择 ──
     print("\n" + "=" * 72)
-    print(f"⑤ 全局策略选择 (DP): 泵状态翻转 {args.w_state}/台 + 频率变化 {args.w_freq}/Hz "
+    print(f"④ 全局策略选择 (DP): 泵状态翻转 {args.w_state}/台 + 频率变化 {args.w_freq}/Hz "
           f"- 效率 {args.w_eff}/% + 超差 {args.w_viol}/(m3/h)")
     print("=" * 72)
     chosen = select_global_path(cands_per_point, args.w_state, args.w_freq,
@@ -352,14 +285,12 @@ def main():
           f"平均效率 {s_eff:.1f}%")
     print(f"节省: 泵切换 {b_toggle - s_toggle} 次, 频率变化 {b_freq - s_freq:.0f} Hz")
 
-    # ── ⑥ 逐点结果 (DP 选中方案) + 全部候选 ──
+    # ── ⑤ 逐点结果 (DP 选中方案) + 全部候选 ──
     rows = []
     cand_rows = []      # 全部候选 (供多策略 CSV)
     for i, (ts, r) in enumerate(pred.iterrows()):
         total_flow = float(r["Total_Flow"])
         pressure = float(r["Pressure"])
-        slot = i % POINTS_PER_DAY
-        target_flows = total_flow * slot_ratios[slot]
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
         for j, c in enumerate(cands_per_point[i]):
             states_str = "".join(str(int(s)) for s in c["states"])
@@ -377,18 +308,15 @@ def main():
                 "pred_170_1": round(float(c["pred_flows"][0]), 1),
                 "pred_170_2": round(float(c["pred_flows"][1]), 1),
                 "pred_70_3": round(float(c["pred_flows"][2]), 1),
-                "deviation": ", ".join(f"{d:+.1f}" for d in c["deviation"]),
+                "deviation": round(float(c["deviation"]), 1),   # 总流量偏差 (标量)
                 "violation": round(float(c["violation"]), 1),
             })
             if is_sel:
                 rows.append({
                     "timestamp": ts_str,
                     "rank": j + 1,
-                    "Total_Flow": round(total_flow, 1),
+                    "Total_Flow": round(total_flow, 1),          # = 目标总管流量
                     "Pressure": round(pressure, 3),
-                    "q_170_1": round(float(target_flows[0]), 1),
-                    "q_170_2": round(float(target_flows[1]), 1),
-                    "q_70_3": round(float(target_flows[2]), 1),
                     "states": states_str,
                     "freqs": freqs_str,
                     "pred_170_1": round(float(c["pred_flows"][0]), 1),
@@ -408,7 +336,7 @@ def main():
     pd.DataFrame(cand_rows).to_csv(cand_path, index=False, encoding="utf-8-sig")
     print(f"[OK] 全部候选策略已保存: {cand_path} ({len(cand_rows)} 行)")
 
-    # ── ⑦ 连续时段合并 ──
+    # ── ⑥ 连续时段合并 ──
     # 时段划分: 每个预测时刻 t 对应执行窗口 [t-15min, t+15min) (该时刻的预测流量/
     # 目标压力在该窗口内生效); 故块起点 = 首点时刻 - 15min, 块终点 = 末点时刻 + 15min。
     # 合并条件: 相邻时间点的泵组组合与各泵频率完全一致。
@@ -464,7 +392,7 @@ def main():
                   f"{b.states:<10}{b.freqs:<22}"
                   f"{b.efficiency_mean:>6.1f}{b.kwt_mean:>8.1f}")
 
-    # ── ⑧ 汇总 ──
+    # ── ⑦ 汇总 ──
     n_feas = int(df_out["feasible"].sum())
     total_elapsed = time.perf_counter() - t_start
     print("\n" + "=" * 72)

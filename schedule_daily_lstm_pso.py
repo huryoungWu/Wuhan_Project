@@ -369,7 +369,7 @@ def main():
                 "pred_170_1": round(float(c["pred_flows"][0]), 1),
                 "pred_170_2": round(float(c["pred_flows"][1]), 1),
                 "pred_70_3": round(float(c["pred_flows"][2]), 1),
-                "deviation": ", ".join(f"{d:+.1f}" for d in c["deviation"]),
+                "deviation": round(float(c["deviation"]), 1),   # 总流量偏差 (标量, pump_optimize_PSO 口径变更)
                 "violation": round(float(c["violation"]), 1),
             })
             if is_sel:

@@ -9,7 +9,8 @@
   - 吸水井液位: (m) — 用于压力修正
 
 寻优 (粒子群优化):
-  - 约束: 模型预测流量与目标流量偏差 ≤ ±100 m³/h
+  - 约束: 模型预测总管流量 (三管求和) 与目标总管流量偏差 ≤ ±100 m³/h
+         (偏差 = |预测总管流量 − 目标总管流量|, 不再逐管比较)
   - 目标: 满足约束的前提下, 预测总管效率最大化
   - 频率: 强制整数 Hz (30~50, 共21档), 与现场变频器整数设定一致;
          第7号泵 (P7) 固定只有 0 / 50 Hz 两个状态 (现场定频工况)
@@ -42,7 +43,7 @@ from pump_inference import PumpInference
 N_PUMPS = 7
 FREQ_MIN = 30.0            # 运行泵最低频率 (Hz)
 FREQ_MAX = 50.0            # 运行泵最高频率 (Hz)
-FLOW_TOL = 100.0           # 流量容差 (m3/h)
+FLOW_TOL = 100.0           # 总流量容差 (m3/h): 偏差 = |预测总管流量 − 目标总管流量|
 PRESSURE_TOL = 0.01        # 压力容差 (MPa) — 压力在给定值 ±0.01 内微调
 PENALTY = 1.0              # 超差惩罚系数 (每个 m3/h 扣 1 个效率点)
 
@@ -127,8 +128,10 @@ def evaluate(model, genes, target_flows, pressure_target, level, stats=None):
         stats['infer_time'] += time.perf_counter() - t0
     f1, f2, f3, eff = map(np.atleast_1d, (f1, f2, f3, eff))
     pred_flows = np.column_stack([f1, f2, f3])
-    violation = np.sum(np.maximum(np.abs(pred_flows - np.asarray(target_flows)) - FLOW_TOL, 0.0),
-                       axis=1)
+    # 总流量口径: 三管预测求和 vs 目标流量求和, 偏差 = |预测总管 − 目标总管| (单个标量)
+    total_pred = f1 + f2 + f3
+    total_target = np.sum(np.asarray(target_flows, dtype=np.float64))
+    violation = np.maximum(np.abs(total_pred - total_target) - FLOW_TOL, 0.0)
     fitness = eff - PENALTY * violation
     return fitness, pred_flows, total_flow, eff, states, freqs, pressure
 
@@ -227,8 +230,9 @@ def optimize_strategy(model, target_flows, pressure, level,
         stats['n_samples'] += 1
         stats['infer_time'] += time.perf_counter() - t0
         pred_flows = np.array([f1, f2, f3])
-        deviation = np.abs(pred_flows - target_flows)
-        violation = float(np.sum(np.maximum(deviation - FLOW_TOL, 0.0)))
+        # 总流量口径: 偏差 = |预测总管流量 − 目标总管流量| (单个标量, 非逐管)
+        deviation = float(np.abs(np.sum(pred_flows) - float(np.sum(target_flows))))
+        violation = float(np.maximum(deviation - FLOW_TOL, 0.0))
         candidates.append({
             'states': states,
             'freqs': freqs,
@@ -310,14 +314,19 @@ def optimize_strategy(model, target_flows, pressure, level,
 def print_result(result):
     t = result['target_flows']
     num = result.get('num_unique_states', len(result['candidates']))
+    if np.ndim(t) == 0:
+        t_str = f"总管流量={t:.0f}"
+    else:
+        t_str = (f"170:1={t[0]:.0f}  170:2={t[1]:.0f}  70:3={t[2]:.0f} m3/h "
+                 f"(总和 {np.sum(t):.0f})")
     print("\n" + "=" * 72)
-    print(f"目标: 170:1={t[0]:.0f}  170:2={t[1]:.0f}  70:3={t[2]:.0f} m3/h | "
+    print(f"目标: {t_str} | "
           f"压力={result['pressure_target']:.3f}±0.01 MPa | 液位={result['level']:.2f} m")
     print(f"找到 {num} 种不同的泵状态组合 (期望 {len(result['candidates'])} 种)")
     print("=" * 72)
 
     for rank, cand in enumerate(result['candidates'], 1):
-        status = '✓ 偏差可控' if cand['feasible'] else '✗ 偏差较大'
+        status = 'OK 偏差可控' if cand['feasible'] else 'XX 偏差较大'   # GBK 控制台不可用 ✓/✗, 用 ASCII
         print(f"\n方案{rank} [{status}] 预测效率 {cand['efficiency']:.1f}%  |  千吨水电耗 {cand['kwt']:.1f} kWh")
         print(f"  泵号:  {' '.join(f'P{i+1}' for i in range(N_PUMPS))}")
         print(f"  状态:  {' '.join('开 ' if s else '关 ' for s in cand['states'])}")
@@ -325,7 +334,9 @@ def print_result(result):
         print(f"  压力:  {cand['pressure']:.4f} MPa (修正后送模型)")
         print(f"  预测流量: 170:1={cand['pred_flows'][0]:.1f}  170:2={cand['pred_flows'][1]:.1f}  "
               f"70:3={cand['pred_flows'][2]:.1f} m3/h")
-        print(f"  偏差:    {' '.join(f'{d:+.1f}' for d in cand['deviation'])} m3/h (容差 ±{FLOW_TOL:.0f})")
+        t_total = float(np.sum(result['target_flows']))
+        print(f"  总流量:  目标 {t_total:.0f} m3/h, 预测 {cand['total_flow']:.1f} m3/h, "
+              f"偏差 {cand['deviation']:+.1f} m3/h (容差 ±{FLOW_TOL:.0f})")
         print(f"  总管流量: {cand['total_flow']:.1f} m3/h")
 
     # 推理耗时
